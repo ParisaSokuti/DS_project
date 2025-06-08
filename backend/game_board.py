@@ -20,6 +20,7 @@ class GameBoard:
         self.current_trick = []
         self.led_suit = None
         self.game_phase = "lobby"  # lobby -> initial_deal -> trump_selection -> gameplay -> completed
+        self.played_cards = []  # Add this line
 
     def _create_deck(self) -> List[str]:
         """Create a standard 52-card deck"""
@@ -28,38 +29,49 @@ class GameBoard:
         return [f"{rank}_{suit}" for suit in suits for rank in ranks]
 
     def assign_teams_and_hakem(self) -> Dict[str, List[str]]:
-        """Assign teams based on first two Aces found during dealing"""
+        """Assign teams based on first two Aces found during dealing, with process printout"""
         temp_deck = self.deck.copy()
         random.shuffle(temp_deck)
         aces_found = []
         current_player_idx = 0
-        
+
+        print("=== Hakem Selection Process ===")
+        print(f"Players: {self.players}")
+        print("Shuffling deck and dealing cards to find Aces...")
+
         while len(aces_found) < 2 and temp_deck:
             card = temp_deck.pop(0)
+            player = self.players[current_player_idx]
+            print(f"Dealt {card} to {player}")
             if card.startswith('A_'):
-                aces_found.append(self.players[current_player_idx])
+                print(f"  -> {player} found an Ace!")
+                aces_found.append(player)
             current_player_idx = (current_player_idx + 1) % 4
 
         # Assign teams and reorder players
         if len(aces_found) >= 2:
             self.hakem = aces_found[0]
             partner = aces_found[1]
+            print(f"Hakem: {self.hakem}, Partner: {partner}")
         else:
             self.hakem = random.choice(self.players)
             partner = random.choice([p for p in self.players if p != self.hakem])
-        
+            print(f"No two Aces found. Randomly selected Hakem: {self.hakem}, Partner: {partner}")
+
         self.teams = {
             self.hakem: 0,
             partner: 0,
             **{p: 1 for p in self.players if p not in {self.hakem, partner}}
         }
-        
+
         # Reorder players: Hakem first, then clockwise order
         hakem_idx = self.players.index(self.hakem)
         self.players = self.players[hakem_idx:] + self.players[:hakem_idx]
         self.current_turn = 0  # Hakem leads first
-        
+
         self.game_phase = "initial_deal"
+        print(f"Teams: {self.teams}")
+        print("=== End Hakem Selection ===\n")
         return {"teams": self.teams, "hakem": self.hakem}
 
     def initial_deal(self) -> Dict[str, List[str]]:
@@ -101,30 +113,23 @@ class GameBoard:
         self.game_phase = "gameplay"
         return {p: self.hands[p].copy() for p in self.players}
 
-    def validate_play(self, player: str, card: str) -> Tuple[bool, str]:
-        """Check if a card play is valid"""
+    def validate_play(self, player, card):
+        # Only allow play if it's player's turn and card is in hand
         if self.game_phase != "gameplay":
             return False, "Game not in progress"
-        
         if player != self.players[self.current_turn]:
             return False, "Not your turn"
-        
         if card not in self.hands[player]:
             return False, "Card not in hand"
-        
-        # First card in trick sets led suit
-        if not self.current_trick:
-            return True, "Valid lead"
-        
-        # Check suit following rules
-        led_suit = self.current_trick[0][1].split('_')[1]
-        card_suit = card.split('_')[1]
-        has_led_suit = any(c.split('_')[1] == led_suit for c in self.hands[player])
-        
-        if has_led_suit and card_suit != led_suit:
-            return False, "Must follow led suit"
-            
-        return True, "Valid play"
+
+        # Enforce follow suit
+        if self.current_trick:
+            led_suit = self.current_trick[0][1].split('_')[1]
+            card_suit = card.split('_')[1]
+            has_led_suit = any(c.split('_')[1] == led_suit for c in self.hands[player])
+            if has_led_suit and card_suit != led_suit:
+                return False, f"You must follow suit: {led_suit}"
+        return True, ""
 
     def play_card(self, player: str, card: str) -> Dict[str, Any]:
         """Process a card play and update game state"""
@@ -134,7 +139,7 @@ class GameBoard:
         
         # Remove card from hand and add to trick
         self.hands[player].remove(card)
-        self.current_trick.append((player, card))
+        self.played_cards.append(card)  # Track played card
         
         # Set led suit if first card
         if len(self.current_trick) == 1:
@@ -229,6 +234,7 @@ class GameBoard:
         self.current_trick = []
         self.led_suit = None
         self.game_phase = "initial_deal"
+        self.played_cards = []
 
     def _card_value(self, rank: str) -> int:
         """Get numeric value for card comparison"""
@@ -259,18 +265,4 @@ class GameBoard:
             state["all_hands"] = {p: cards.copy() for p, cards in self.hands.items()}
             
         return state
-
-# Utility function for card display
-def card_to_emoji(card: str) -> str:
-    suit_emojis = {
-        'hearts': '❤️',
-        'diamonds': '♦️',
-        'clubs': '♣️',
-        'spades': '♠️'
-    }
-    try:
-        rank, suit = card.split('_')
-        return f"{suit_emojis[suit]}{rank}"
-    except:
-        return card
 
