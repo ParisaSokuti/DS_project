@@ -17,6 +17,11 @@ games = {}  # room_code -> GameBoard instance
 player_rooms = {}  # websocket -> room_code
 player_objects = {}  # websocket -> Player object
 
+# --- Force all users into a single room for testing (delete this block later) ---
+SINGLE_TEST_ROOM = "9999"  # delete this line later
+rooms[SINGLE_TEST_ROOM] = []  # delete this line later
+# -------------------------------------------------------------------------------
+
 def card_to_emoji(card: str) -> str:
     """Convert a card string like 'A_hearts' to '❤️A'."""
     suit_emojis = {
@@ -80,7 +85,7 @@ async def handle_game_start(room_code):
         )
     
     # Deal initial cards
-    await game.deal_initial_cards()
+    game.initial_deal()
     
     # Send initial hands and trump selection prompt
     for player in player_objects:
@@ -110,21 +115,25 @@ async def handle_connection(websocket, path):
     join_msg = await NetworkManager.receive_message(websocket)
     if not join_msg:
         return
-    
+
     username = join_msg.get("username", f"player{random.randint(100, 999)}")
     action = join_msg.get("type")
-    room_code = join_msg.get("room_code")
+    # room_code = join_msg.get("room_code")  # delete this line later
 
     player_id = str(uuid.uuid4())
     player = Player(player_id=player_id, wsconnection=websocket, username=username)
-    
+
     # Store player mapping
     player_objects[websocket] = player
-    
+
+    # --- Force all users into a single room for testing (delete this block later) ---
+    room_code = SINGLE_TEST_ROOM  # delete this line later
+    # -------------------------------------------------------------------------------
+
     # Room creation or joining
     if action == "create_room":
-        room_code = generate_room_code()
-        rooms[room_code] = []
+        # room_code = generate_room_code()  # delete this line later
+        # rooms[room_code] = []  # delete this line later
         print(f"New room created: {room_code}")
 
     if action in ("join_room", "create_room"):

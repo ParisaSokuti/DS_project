@@ -273,3 +273,4 @@ def card_to_emoji(card: str) -> str:
         return f"{suit_emojis[suit]}{rank}"
     except:
         return card
+

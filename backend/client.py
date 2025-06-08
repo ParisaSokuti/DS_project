@@ -74,21 +74,24 @@ async def get_valid_suit_choice():
 
 async def main():
     print("Welcome to Hokm!")
-    username = input("Enter your username (or press Enter for default): ").strip()
-    if not username:
-        username = f"player{random.randint(100,999)}"
-        print(f"Using default username: {username}")
+    # username = input("Enter your username (or press Enter for default): ").strip()  # uncomment later
+    # if not username:  # uncomment later
+    #     username = f"player{random.randint(100,999)}"  # uncomment later
+    #     print(f"Using default username: {username}")  # uncomment later
+    username = f"player{random.randint(100,999)}"  # auto-generate for testing
 
-    room_code = input("Enter your room code (or press Enter to create new room): ").strip()
-    action = "join_room" if room_code else "create_room"
+    # room_code = input("Enter your room code (or press Enter to create new room): ").strip()  # uncomment later
+    # action = "join_room" if room_code else "create_room"  # uncomment later
+    room_code = ""  # always create new room for testing
+    action = "create_room"
 
     async with websockets.connect(SERVER_URI) as ws:
         msg = {
             "type": action,
             "username": username,
         }
-        if room_code:
-            msg["room_code"] = room_code
+        # if room_code:  # uncomment later
+        #     msg["room_code"] = room_code  # uncomment later
         await ws.send(json.dumps(msg))
         your_hand = []
         trump_suit = None
