@@ -22,20 +22,6 @@ SINGLE_TEST_ROOM = "9999"  # delete this line later
 rooms[SINGLE_TEST_ROOM] = []  # delete this line later
 # -------------------------------------------------------------------------------
 
-def card_to_emoji(card: str) -> str:
-    """Convert a card string like 'A_hearts' to '❤️A'."""
-    suit_emojis = {
-        'hearts': '❤️',
-        'diamonds': '♦️',
-        'clubs': '♣️',
-        'spades': '♠️'
-    }
-    try:
-        rank, suit = card.split('_')
-        return f"{suit_emojis[suit]}{rank}"
-    except Exception:
-        return card
-
 def generate_room_code():
     return f"{random.randint(1000, 9999)}"
 
@@ -56,7 +42,7 @@ async def start_first_trick(room_code):
             {
                 "current_player": first_player,
                 "your_turn": p.username == first_player,
-                "hand": [card_to_emoji(c) for c in game.hands[p.username]]
+                "hand": game.hands[p.username][:]
             }
         )
 
@@ -94,7 +80,7 @@ async def handle_game_start(room_code):
                 player.wsconnection,
                 "initial_deal",
                 {
-                    "hand": [card_to_emoji(c) for c in game.hands[player.username]],
+                    "hand": game.hands[player.username][:],
                     "is_hakem": True,
                     "message": "You are the Hakem. Choose a trump suit based on your 5 cards."
                 }
@@ -104,7 +90,7 @@ async def handle_game_start(room_code):
                 player.wsconnection,
                 "initial_deal",
                 {
-                    "hand": [card_to_emoji(c) for c in game.hands[player.username]],
+                    "hand": game.hands[player.username][:],
                     "is_hakem": False,
                     "message": f"Waiting for {game.hakem} to choose trump suit."
                 }
@@ -194,6 +180,7 @@ async def handle_connection(websocket, path):
                 if game and player.username == game.hakem:
                     if game.set_trump_suit(suit):
                         print(f"Suit of room {room_code} is currently [{suit}]")
+                        print(f"hokm is {suit}")  # <-- Add this line
                         
                         # Broadcast trump selection to all players
                         for p in rooms[room_code]:
@@ -204,12 +191,12 @@ async def handle_connection(websocket, path):
                             )
                         
                         # Deal remaining cards
-                        await game.deal_remaining_cards()
+                        game.final_deal()
                         for p in rooms[room_code]:
                             await NetworkManager.send_message(
                                 p.wsconnection,
                                 "final_deal",
-                                {"hand": [card_to_emoji(c) for c in game.hands[p.username]]}
+                                {"hand": game.hands[p.username][:]}
                             )
                         
                         # Start first trick
@@ -229,6 +216,7 @@ async def handle_connection(websocket, path):
                     continue
 
                 card = data.get('card')
+                print(f"room [{room_code}], Player {player.username} played {card}")  # <-- Add this line
                 result = game.play_card(player.username, card)
                 
                 if not result.get('valid'):
@@ -244,8 +232,8 @@ async def handle_connection(websocket, path):
                         "card_played",
                         {
                             "player": player.username,
-                            "card": card_to_emoji(card),
-                            "remaining_hand": [card_to_emoji(c) for c in game.hands[p.username]]
+                            "card": card,  # send raw card string
+                            "remaining_hand": game.hands[p.username][:]
                         }
                     )
 
@@ -296,16 +284,26 @@ async def handle_connection(websocket, path):
                             del games[room_code]
                             return
 
+                # Count hand completion for round tracking
+                if result.get('hand_complete'):
+                    # Count how many hands have been completed in this game
+                    if not hasattr(game, 'round_number'):
+                        game.round_number = 1
+                    else:
+                        game.round_number += 1
+                    print(f"room [{room_code}], Round {game.round_number} finished")
+
                 # Start next turn
                 next_player = game.players[game.current_turn]
                 for p in rooms[room_code]:
+                    hand = [c for c in game.hands[p.username] if c not in game.played_cards]
                     await NetworkManager.send_message(
                         p.wsconnection,
                         "turn_start",
                         {
                             "current_player": next_player,
                             "your_turn": p.username == next_player,
-                            "hand": [card_to_emoji(c) for c in game.hands[p.username]]
+                            "hand": hand
                         }
                     )
                     
