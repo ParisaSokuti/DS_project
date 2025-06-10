@@ -1,133 +1,207 @@
 # network.py (Backend)
 import asyncio
 import json
-import uuid
-import redis
 import websockets
-from websockets.server import serve, WebSocketServerProtocol
-from typing import Dict, Optional
+import time
+from typing import Dict, Optional, Any, Union
+from websockets.server import WebSocketServerProtocol
+from websockets.client import WebSocketClientProtocol
+from redis_manager import RedisManager
+
+# Type alias for websocket connections
+WebSocket = Union[WebSocketServerProtocol, WebSocketClientProtocol]
 
 class NetworkManager:
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(NetworkManager, cls).__new__(cls)
+            cls._instance.initialized = False
+        return cls._instance
+    
     def __init__(self):
-        self.redis = redis.Redis(host='localhost', port=6379, db=0)
-        self.active_connections: Dict[str, WebSocketServerProtocol] = {}
-        self.player_rooms: Dict[str, str] = {}
-
-    async def handle_connection(self, websocket):
-        """Main WebSocket connection handler"""
-        player_id = str(uuid.uuid4())
-        self.active_connections[player_id] = websocket
-        
-        try:
-            async for message in websocket:
-                await self.route_message(player_id, json.loads(message))
-        except websockets.ConnectionClosed:
-            await self.handle_disconnect(player_id)
-
-    async def route_message(self, player_id: str, data: dict):
-        """Route incoming messages to appropriate handlers"""
-        msg_type = data.get('type')
-        handler = {
-            'authenticate': self.handle_auth,
-            'join_queue': self.handle_queue,
-            'play_card': self.handle_game_action,
-            'keepalive': lambda pid, d: None
-        }.get(msg_type)
-        
-        if handler:
-            await handler(player_id, data)
-        else:
-            await self.send(player_id, {'type': 'error', 'message': 'Invalid message type'})
-
-    async def handle_auth(self, player_id: str, data: dict):
-        """Authentication handler"""
-        # Implement your actual auth logic here
-        success = True  # Replace with real auth check
-        if success:
-            await self.send(player_id, {
-                'type': 'auth_success',
-                'token': 'generated_jwt_token'
-            })
-        else:
-            await self.send(player_id, {'type': 'auth_failed'})
-
-    async def handle_queue(self, player_id: str, data: dict):
-        """Matchmaking queue handler"""
-        game_type = data.get('game_type', '4p')
-        lobby_key = f'lobby:{game_type}'
-        
-        # Add to Redis queue
-        self.redis.rpush(lobby_key, player_id)
-        
-        # Check if ready to start game
-        queue_size = self.redis.llen(lobby_key)
-        if queue_size >= (4 if game_type == '4p' else 2):
-            players = [self.redis.lpop(lobby_key).decode() for _ in range(queue_size)]
-            await self.create_game(players, game_type)
-
-    async def create_game(self, player_ids: list, game_type: str):
-        """Initialize new game room"""
-        room_id = str(uuid.uuid4())[:8]
-        game_state = {
-            'players': player_ids,
-            'status': 'starting',
-            'trump_suit': None,
-            'current_turn': 0
-        }
-        
-        # Store in Redis
-        self.redis.hset(f'game:{room_id}', mapping=game_state)
-        
-        # Notify players
-        for pid in player_ids:
-            self.player_rooms[pid] = room_id
-            await self.send(pid, {
-                'type': 'game_start',
-                'room_id': room_id,
-                'players': player_ids
-            })
-
-    async def handle_game_action(self, player_id: str, data: dict):
-        """Handle in-game actions"""
-        room_id = self.player_rooms.get(player_id)
-        if not room_id:
-            return
-            
-        # Validate game state
-        game_state = self.redis.hgetall(f'game:{room_id}')
-        if not game_state:
-            return
-
-        # Broadcast to other players
-        for pid in json.loads(game_state[b'players']):
-            if pid != player_id:
-                await self.send(pid, {
-                    'type': 'game_update'
-                })
-
+        if not self.initialized:
+            self.redis_manager = RedisManager()
+            self.initialized = True
+    
     @staticmethod
-    async def send_message(
-        websocket: WebSocketServerProtocol,
-        message_type: str,
-        data: dict = None
-    ):
-        """Send a JSON message over the websocket."""
-        message = {"type": message_type}
-        if data:
-            message.update(data)
+    async def send_message(websocket: WebSocket, message_type: str, data: Optional[Dict[str, Any]] = None) -> bool:
+        """Send a message to a websocket with proper error handling"""
         try:
+            message = {"type": message_type}
+            if data:
+                message.update(data)
             await websocket.send(json.dumps(message))
+            return True
         except websockets.ConnectionClosed:
-            print("Connection closed while sending message")
+            print("[ERROR] Connection closed while sending message")
+            return False
+        except Exception as e:
+            print(f"[ERROR] Failed to send message: {str(e)}")
+            return False
+            
+    @staticmethod
+    async def broadcast_to_room(room_code: str, msg_type: str, data: Dict[str, Any], redis_manager: RedisManager):
+        """Broadcast a message to all players in a room"""
+        try:
+            players = redis_manager.get_room_players(room_code)
+            for player in players:
+                if 'wsconnection' in player:
+                    await NetworkManager.send_message(
+                        player['wsconnection'],
+                        msg_type,
+                        data
+                    )
+        except Exception as e:
+            print(f"[ERROR] Failed to broadcast to room {room_code}: {str(e)}")
+            
+    @staticmethod
+    async def broadcast_game_state(room_code: str, game_state: Dict[str, Any], redis_manager: RedisManager):
+        """Broadcast current game state to all players in a room"""
+        try:
+            players = redis_manager.get_room_players(room_code)
+            for player in players:
+                if 'wsconnection' in player and 'username' in player:
+                    # Customize state data for each player
+                    player_state = game_state.copy()
+                    player_state.update({
+                        'you': player['username'],
+                        'hand': json.loads(game_state.get(f'hand_{player["username"]}', '[]')),
+                        'your_team': "1" if player['username'] in json.loads(game_state['teams'])['1'] else "2"
+                    })
+                    await NetworkManager.send_message(
+                        player['wsconnection'],
+                        'game_state',
+                        player_state
+                    )
+        except Exception as e:
+            print(f"[ERROR] Failed to broadcast game state to room {room_code}: {str(e)}")
+            
+    @staticmethod
+    async def notify_error(websocket, message: str):
+        """Send an error message to a websocket"""
+        await NetworkManager.send_message(
+            websocket,
+            'error',
+            {'message': message}
+        )
 
     @staticmethod
-    async def receive_message(websocket):
+    async def handle_player_connected(websocket, room_code: str, player_data: Dict[str, Any], redis_manager: RedisManager):
+        """Handle new player connection"""
+        try:
+            # Save session and room data
+            redis_manager.save_player_session(
+                player_data['player_id'],
+                {
+                    'username': player_data['username'],
+                    'room_code': room_code,
+                    'connected_at': str(int(time.time())),
+                    'expires_at': str(int(time.time()) + 3600)
+                }
+            )
+
+            # Add to room
+            redis_manager.add_player_to_room(room_code, {
+                **player_data,
+                'joined_at': str(int(time.time()))
+            })
+
+            # Send confirmation
+            await NetworkManager.send_message(
+                websocket,
+                'join_success',
+                {
+                    'username': player_data['username'],
+                    'player_id': player_data['player_id'],
+                    'room_code': room_code,
+                    'player_number': player_data.get('player_number', 0)
+                }
+            )
+
+            print(f"[LOG] Player {player_data['username']} connected to room {room_code}")
+            return True
+
+        except Exception as e:
+            print(f"[ERROR] Failed to handle player connection: {str(e)}")
+            await NetworkManager.notify_error(websocket, "Failed to join room")
+            return False
+
+    @staticmethod
+    async def handle_player_disconnected(room_code: str, player_data: Dict[str, Any], redis_manager: RedisManager):
+        """Handle player disconnection"""
+        try:
+            # Save disconnect time
+            redis_manager.save_player_session(
+                player_data['player_id'],
+                {
+                    'disconnected_at': str(int(time.time())),
+                    'room_code': room_code
+                }
+            )
+
+            print(f"[LOG] Player {player_data['username']} disconnected from room {room_code}")
+
+            # Notify other players
+            await NetworkManager.broadcast_to_room(
+                room_code,
+                'player_disconnected',
+                {
+                    'username': player_data['username'],
+                    'temporary': True  # Allow reconnection
+                },
+                redis_manager
+            )
+
+        except Exception as e:
+            print(f"[ERROR] Failed to handle player disconnection: {str(e)}")
+            
+    @staticmethod
+    async def handle_player_reconnected(websocket, room_code: str, player_data: Dict[str, Any], redis_manager: RedisManager):
+        """Handle player reconnection"""
+        try:
+            # Update session
+            redis_manager.save_player_session(
+                player_data['player_id'],
+                {
+                    'reconnected_at': str(int(time.time())),
+                    'expires_at': str(int(time.time()) + 3600),
+                    'room_code': room_code
+                }
+            )
+
+            # Get current game state
+            game_state = redis_manager.get_game_state(room_code)
+            if game_state:
+                await NetworkManager.broadcast_game_state(room_code, game_state, redis_manager)
+
+            print(f"[LOG] Player {player_data['username']} reconnected to room {room_code}")
+
+            # Notify other players
+            await NetworkManager.broadcast_to_room(
+                room_code,
+                'player_reconnected',
+                {'username': player_data['username']},
+                redis_manager
+            )
+
+            return True
+
+        except Exception as e:
+            print(f"[ERROR] Failed to handle player reconnection: {str(e)}")
+            await NetworkManager.notify_error(websocket, "Failed to reconnect")
+            return False
+
+    @staticmethod
+    async def receive_message(websocket: WebSocket) -> Optional[Dict[str, Any]]:
+        """Receive and parse a JSON message from websocket"""
         try:
             message = await websocket.recv()
             return json.loads(message)
         except websockets.ConnectionClosed:
-            print("Connection closed while receiving message")
+            print("[ERROR] Connection closed while receiving message")
             return None
         except json.JSONDecodeError:
-            print("Invalid JSON received")
+            print("[ERROR] Invalid JSON received")
             return None
