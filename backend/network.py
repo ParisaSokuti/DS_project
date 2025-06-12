@@ -3,13 +3,16 @@ import asyncio
 import json
 import websockets
 import time
-from typing import Dict, Optional, Any, Union
-from websockets.server import WebSocketServerProtocol
-from websockets.client import WebSocketClientProtocol
-from redis_manager import RedisManager
+from typing import Optional, Dict, Any
+try:
+    from websockets.legacy.server import WebSocketServerProtocol
+except ImportError:
+    try:
+        from websockets.server import WebSocketServerProtocol
+    except ImportError:
+        WebSocketServerProtocol = Any
 
-# Type alias for websocket connections
-WebSocket = Union[WebSocketServerProtocol, WebSocketClientProtocol]
+from .redis_manager import RedisManager
 
 class NetworkManager:
     _instance = None
@@ -22,11 +25,38 @@ class NetworkManager:
     
     def __init__(self):
         if not self.initialized:
+            # Initialize Redis connection
             self.redis_manager = RedisManager()
+            
+            # Store only live WebSocket connections
+            self.live_connections = {}  # Maps player_id -> websocket
+            self.connection_metadata = {}  # Maps websocket -> {player_id, room_code}
+            
             self.initialized = True
+            
+    def register_connection(self, websocket, player_id: str, room_code: str):
+        """Register a new live WebSocket connection"""
+        self.live_connections[player_id] = websocket
+        self.connection_metadata[websocket] = {
+            'player_id': player_id,
+            'room_code': room_code,
+            'connected_at': int(time.time())
+        }
+        
+    def remove_connection(self, websocket):
+        """Remove a WebSocket connection"""
+        if websocket in self.connection_metadata:
+            player_id = self.connection_metadata[websocket]['player_id']
+            if player_id in self.live_connections:
+                del self.live_connections[player_id]
+            del self.connection_metadata[websocket]
+            
+    def get_live_connection(self, player_id: str):
+        """Get a player's live WebSocket connection if it exists"""
+        return self.live_connections.get(player_id)
     
     @staticmethod
-    async def send_message(websocket: WebSocket, message_type: str, data: Optional[Dict[str, Any]] = None) -> bool:
+    async def send_message(websocket, message_type: str, data: Optional[Dict[str, Any]] = None) -> bool:
         """Send a message to a websocket with proper error handling"""
         try:
             message = {"type": message_type}
@@ -41,42 +71,102 @@ class NetworkManager:
             print(f"[ERROR] Failed to send message: {str(e)}")
             return False
             
-    @staticmethod
-    async def broadcast_to_room(room_code: str, msg_type: str, data: Dict[str, Any], redis_manager: RedisManager):
-        """Broadcast a message to all players in a room"""
+    async def broadcast_to_room(self, room_code: str, msg_type: str, data: Dict[str, Any], redis_manager: RedisManager):
+        """
+        Broadcast a message to all live connections in a room.
+        Room membership is checked from Redis but messages are sent only to live connections.
+        """
         try:
+            # Get all players in room from Redis
             players = redis_manager.get_room_players(room_code)
+            
+            # Send message only to players with live connections
             for player in players:
-                if 'wsconnection' in player:
-                    await NetworkManager.send_message(
-                        player['wsconnection'],
-                        msg_type,
-                        data
-                    )
+                player_id = player.get('player_id')
+                if not player_id:
+                    continue
+                    
+                # Get live connection for player if it exists
+                ws = self.get_live_connection(player_id)
+                if ws:
+                    # Customize message for player if needed
+                    player_data = data.copy()
+                    player_data.update({
+                        'you': player.get('username'),
+                        'player_number': player.get('player_number', 0)
+                    })
+                    
+                    await self.send_message(ws, msg_type, player_data)
+                else:
+                    print(f"[INFO] Player {player.get('username')} has no live connection")
+                    
+            # Always persist broadcast in Redis for state recovery
+            broadcast_key = f"broadcast:{room_code}:{int(time.time())}"
+            redis_manager.redis.set(
+                broadcast_key,
+                json.dumps({
+                    'type': msg_type,
+                    'data': data,
+                    'timestamp': time.time()
+                }),
+                ex=3600  # Expire after 1 hour
+            )
+                    
         except Exception as e:
             print(f"[ERROR] Failed to broadcast to room {room_code}: {str(e)}")
             
-    @staticmethod
-    async def broadcast_game_state(room_code: str, game_state: Dict[str, Any], redis_manager: RedisManager):
-        """Broadcast current game state to all players in a room"""
+        # Log broadcast for debugging
+        print(f"[DEBUG] Broadcast {msg_type} to room {room_code}")
+        print(f"[DEBUG] Active connections: {len(self.live_connections)}")
+            
+    async def broadcast_game_state(self, room_code: str, game_state: Dict[str, Any], redis_manager: RedisManager):
+        """Broadcast current game state to all live connections, persisting in Redis"""
         try:
+            # 1. Save complete state to Redis first
+            redis_manager.save_game_state(room_code, game_state)
+            
+            # 2. Send state updates to live connections
             players = redis_manager.get_room_players(room_code)
+            teams = json.loads(game_state.get('teams', '{}'))
+            
             for player in players:
-                if 'wsconnection' in player and 'username' in player:
-                    # Customize state data for each player
-                    player_state = game_state.copy()
-                    player_state.update({
-                        'you': player['username'],
-                        'hand': json.loads(game_state.get(f'hand_{player["username"]}', '[]')),
-                        'your_team': "1" if player['username'] in json.loads(game_state['teams'])['1'] else "2"
-                    })
-                    await NetworkManager.send_message(
-                        player['wsconnection'],
-                        'game_state',
-                        player_state
-                    )
+                player_id = player.get('player_id')
+                if not player_id:
+                    continue
+                
+                # Only send to live connections
+                ws = self.get_live_connection(player_id)
+                if not ws:
+                    continue
+                    
+                username = player.get('username')
+                if not username:
+                    continue
+                    
+                # Customize state for each player
+                player_state = {
+                    'type': 'game_state',
+                    'phase': game_state.get('game_phase', 'unknown'),
+                    'you': username,
+                    'hand': json.loads(game_state.get(f'hand_{username}', '[]')),
+                    'your_team': "1" if username in teams.get('1', []) else "2",
+                    'hakem': game_state.get('hakem'),
+                    'hokm': game_state.get('hokm'),
+                    'current_turn': game_state.get('current_turn'),
+                    'tricks': json.loads(game_state.get('tricks', '{}')),
+                    'room_code': room_code,
+                    'teams': teams
+                }
+                
+                await self.send_message(ws, 'game_state', player_state)
+                
+            # Log successful broadcast
+            print(f"[LOG] Game state broadcast to {len(self.live_connections)} live connection(s) in room {room_code}")
+            
         except Exception as e:
             print(f"[ERROR] Failed to broadcast game state to room {room_code}: {str(e)}")
+            # Log error details for debugging
+            print(f"[DEBUG] Game state: {game_state}")
             
     @staticmethod
     async def notify_error(websocket, message: str):
@@ -88,113 +178,199 @@ class NetworkManager:
         )
 
     @staticmethod
-    async def handle_player_connected(websocket, room_code: str, player_data: Dict[str, Any], redis_manager: RedisManager):
-        """Handle new player connection"""
+    async def notify_info(websocket, message: str):
+        """Send an info message to a websocket"""
+        await NetworkManager.send_message(
+            websocket,
+            'info',
+            {'message': message}
+        )
+
+    async def handle_player_connected(self, websocket, room_code: str, player_data: Dict[str, Any], redis_manager: RedisManager):
+        """Handle new player connection with improved session management"""
         try:
-            # Save session and room data
-            redis_manager.save_player_session(
-                player_data['player_id'],
-                {
-                    'username': player_data['username'],
-                    'room_code': room_code,
-                    'connected_at': str(int(time.time())),
-                    'expires_at': str(int(time.time()) + 3600)
-                }
-            )
-
-            # Add to room
-            redis_manager.add_player_to_room(room_code, {
+            player_id = player_data['player_id']
+            username = player_data['username']
+            
+            # 1. Save session data in Redis
+            session_data = {
+                'username': username,
+                'room_code': room_code,
+                'connected_at': str(int(time.time())),
+                'expires_at': str(int(time.time()) + 3600),
+                'player_number': player_data.get('player_number', 0),
+                'connection_status': 'active'
+            }
+            redis_manager.save_player_session(player_id, session_data)
+            
+            # 2. Register live connection
+            self.register_connection(websocket, player_id, room_code)
+            
+            # 3. Add to room with all metadata
+            room_data = {
                 **player_data,
-                'joined_at': str(int(time.time()))
-            })
-
-            # Send confirmation
-            await NetworkManager.send_message(
-                websocket,
-                'join_success',
-                {
-                    'username': player_data['username'],
-                    'player_id': player_data['player_id'],
-                    'room_code': room_code,
-                    'player_number': player_data.get('player_number', 0)
-                }
-            )
-
-            print(f"[LOG] Player {player_data['username']} connected to room {room_code}")
+                'joined_at': str(int(time.time())),
+                'connection_status': 'active'
+            }
+            redis_manager.add_player_to_room(room_code, room_data)
+            
+            # 4. Get existing game state if available
+            game_state = redis_manager.get_game_state(room_code)
+            join_response = {
+                'username': username,
+                'player_id': player_id,
+                'room_code': room_code,
+                'player_number': player_data.get('player_number', 0)
+            }
+            
+            if game_state:
+                join_response['game_state'] = game_state
+            
+            # 5. Send join confirmation
+            await self.send_message(websocket, 'join_success', join_response)
+            
+            print(f"[LOG] Player {username} connected to room {room_code}")
+            print(f"[DEBUG] Active connections: {len(self.live_connections)}")
             return True
-
+            
         except Exception as e:
             print(f"[ERROR] Failed to handle player connection: {str(e)}")
-            await NetworkManager.notify_error(websocket, "Failed to join room")
+            await self.notify_error(websocket, "Failed to join room")
             return False
 
-    @staticmethod
-    async def handle_player_disconnected(room_code: str, player_data: Dict[str, Any], redis_manager: RedisManager):
-        """Handle player disconnection"""
+    async def handle_player_disconnected(self, websocket, room_code: str, redis_manager: RedisManager):
+        """Handle player disconnection with graceful connection cleanup"""
         try:
-            # Save disconnect time
-            redis_manager.save_player_session(
-                player_data['player_id'],
-                {
-                    'disconnected_at': str(int(time.time())),
-                    'room_code': room_code
-                }
-            )
-
-            print(f"[LOG] Player {player_data['username']} disconnected from room {room_code}")
-
-            # Notify other players
-            await NetworkManager.broadcast_to_room(
+            # 1. Get player data from connection metadata
+            if websocket not in self.connection_metadata:
+                print("[ERROR] No metadata found for disconnected websocket")
+                return False
+                
+            metadata = self.connection_metadata[websocket]
+            player_id = metadata['player_id']
+            
+            # 2. Get player info from Redis
+            session = redis_manager.get_player_session(player_id)
+            if not session:
+                print(f"[ERROR] No session found for player {player_id}")
+                self.remove_connection(websocket)
+                return False
+                
+            username = session.get('username')
+            
+            # 3. Update session in Redis
+            disconnect_data = {
+                'disconnected_at': str(int(time.time())),
+                'room_code': room_code,
+                'connection_status': 'disconnected',
+                # Keep session alive for reconnection
+                'expires_at': str(int(time.time()) + 3600)
+            }
+            redis_manager.save_player_session(player_id, disconnect_data)
+            
+            # 4. Remove live connection
+            self.remove_connection(websocket)
+            
+            # 5. Save game state if in active game
+            game_state = redis_manager.get_game_state(room_code)
+            if game_state:
+                game_state['last_activity'] = str(int(time.time()))
+                redis_manager.save_game_state(room_code, game_state)
+            
+            print(f"[LOG] Player {username} disconnected from room {room_code}")
+            print(f"[DEBUG] Remaining connections: {len(self.live_connections)}")
+            
+            # 6. Notify other players with remaining connection count
+            await self.broadcast_to_room(
                 room_code,
                 'player_disconnected',
                 {
-                    'username': player_data['username'],
-                    'temporary': True  # Allow reconnection
+                    'username': username,
+                    'temporary': True,  # Allow reconnection
+                    'active_players': len(self.live_connections)
                 },
                 redis_manager
             )
-
-        except Exception as e:
-            print(f"[ERROR] Failed to handle player disconnection: {str(e)}")
             
-    @staticmethod
-    async def handle_player_reconnected(websocket, room_code: str, player_data: Dict[str, Any], redis_manager: RedisManager):
-        """Handle player reconnection"""
-        try:
-            # Update session
-            redis_manager.save_player_session(
-                player_data['player_id'],
-                {
-                    'reconnected_at': str(int(time.time())),
-                    'expires_at': str(int(time.time()) + 3600),
-                    'room_code': room_code
-                }
-            )
-
-            # Get current game state
-            game_state = redis_manager.get_game_state(room_code)
-            if game_state:
-                await NetworkManager.broadcast_game_state(room_code, game_state, redis_manager)
-
-            print(f"[LOG] Player {player_data['username']} reconnected to room {room_code}")
-
-            # Notify other players
-            await NetworkManager.broadcast_to_room(
-                room_code,
-                'player_reconnected',
-                {'username': player_data['username']},
-                redis_manager
-            )
-
             return True
 
         except Exception as e:
+            print(f"[ERROR] Failed to handle player disconnection: {str(e)}")
+            # Clean up connection anyway
+            self.remove_connection(websocket)
+            return False
+    async def handle_player_reconnected(self, websocket, player_id: str, redis_manager: RedisManager):
+        """Handle player reconnection with state recovery"""
+        try:
+            # 1. Validate and get session
+            is_valid, session = redis_manager.attempt_reconnect(player_id, {
+                'reconnected_at': str(int(time.time())),
+                'connection_status': 'active'
+            })
+            
+            if not is_valid:
+                await self.notify_error(websocket, session.get('error', 'Failed to reconnect'))
+                return False
+                
+            room_code = session.get('room_code')
+            username = session.get('username')
+            
+            if not room_code or not username:
+                await self.notify_error(websocket, "Invalid session data")
+                return False
+            
+            # 2. Register new connection
+            self.register_connection(websocket, player_id, room_code)
+            
+            # 3. Get current game state
+            game_state = redis_manager.get_game_state(room_code)
+            if not game_state:
+                game_state = {}
+            
+            # 4. Send reconnection success with full state
+            teams = json.loads(game_state.get('teams', '{}'))
+            restored_state = {
+                'username': username,
+                'room_code': room_code,
+                'player_id': player_id,
+                'game_state': {
+                    'phase': game_state.get('game_phase', 'waiting'),
+                    'teams': teams,
+                    'hakem': game_state.get('hakem'),
+                    'hokm': game_state.get('hokm'),
+                    'hand': json.loads(game_state.get(f'hand_{username}', '[]')),
+                    'current_turn': int(game_state.get('current_turn', 0)),
+                    'tricks': json.loads(game_state.get('tricks', '{}')),
+                    'you': username,
+                    'your_team': "1" if username in teams.get('1', []) else "2"
+                }
+            }
+            
+            await self.send_message(websocket, 'reconnect_success', restored_state)
+            
+            print(f"[LOG] Player {username} reconnected to room {room_code}")
+            print(f"[DEBUG] Active connections: {len(self.live_connections)}")
+            
+            # 5. Notify other players
+            await self.broadcast_to_room(
+                room_code,
+                'player_reconnected',
+                {
+                    'username': username,
+                    'active_players': len(self.live_connections)
+                },
+                redis_manager
+            )
+            
+            return True
+            
+        except Exception as e:
             print(f"[ERROR] Failed to handle player reconnection: {str(e)}")
-            await NetworkManager.notify_error(websocket, "Failed to reconnect")
+            await self.notify_error(websocket, "Failed to reconnect")
             return False
 
     @staticmethod
-    async def receive_message(websocket: WebSocket) -> Optional[Dict[str, Any]]:
+    async def receive_message(websocket) -> Optional[Dict[str, Any]]:
         """Receive and parse a JSON message from websocket"""
         try:
             message = await websocket.recv()

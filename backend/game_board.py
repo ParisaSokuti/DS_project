@@ -16,7 +16,9 @@ class GameBoard:
         self.hakem = None
         self.hokm = None
         self.current_turn = 0
-        self.tricks = {0: 0, 1: 0}  # Keep track of tricks only
+        self.tricks = {0: 0, 1: 0}          # current‐hand trick counts
+        self.round_scores = {0: 0, 1: 0}   # number of hands won per team
+        self.completed_tricks = 0         # count of tricks played in this hand
         self.hands = {player: [] for player in players}
         self.current_trick = []
         self.led_suit = None
@@ -34,7 +36,7 @@ class GameBoard:
         ranks = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
         return [f"{rank}_{suit}" for suit in suits for rank in ranks]
 
-    def assign_teams_and_hakem(self) -> Dict[str, Any]:
+    def assign_teams_and_hakem(self, redis_manager=None) -> Dict[str, Any]:
         """
         Assign teams using the following flow:
         1. Choose 1 player randomly for Team 1
@@ -59,7 +61,7 @@ class GameBoard:
         print(f"Team 2 players: {team2_players}")
         
         # Step 4: Choose Hakem randomly from all players (equal chance)
-        self.hakem = random.choice(self.players)  # Any player can be Hakem
+        self.hakem = random.choice(self.players)
         print(f"Hakem selected (random from all players): {self.hakem}")
         
         # Assign teams
@@ -73,20 +75,32 @@ class GameBoard:
         # Reorder players: Hakem first, then clockwise order
         hakem_idx = self.players.index(self.hakem)
         self.players = self.players[hakem_idx:] + self.players[:hakem_idx]
-        self.current_turn = 0  # Hakem leads first
+        self.current_turn = 0
         
         self.game_phase = "initial_deal"
-        print(f"Teams: Team 1: {[first_team1_player, second_team1_player]}")
-        print(f"       Team 2: {team2_players}")
-        print("=== End Team Assignment ===\n")
         
-        return {
+        # Save team assignments and hakem selection to Redis
+        if self.room_code and redis_manager:
+            game_state = {
+                'teams': json.dumps(self.teams),
+                'hakem': self.hakem,
+                'phase': 'team_assignment'
+            }
+            redis_manager.save_game_state(self.room_code, game_state)
+        
+        result = {
             "teams": {
                 "1": [first_team1_player, second_team1_player],
                 "2": team2_players
             },
             "hakem": self.hakem
         }
+        
+        print(f"Teams: Team 1: {[first_team1_player, second_team1_player]}")
+        print(f"       Team 2: {team2_players}")
+        print("=== End Team Assignment ===\n")
+        
+        return result
 
     def initial_deal(self) -> Dict[str, List[str]]:
         """Deal first 5 cards to all players"""
@@ -98,23 +112,69 @@ class GameBoard:
             for player in self.players:
                 self.hands[player].append(self.deck.pop(0))
         
+        print(f"[LOG] Initial deal completed. Changing phase from {self.game_phase} to hokm_selection")
         self.game_phase = "hokm_selection"
         return {p: self.hands[p].copy() for p in self.players}
 
-    def set_hokm(self, suit: str) -> bool:
-        """Validate and set hokm suit"""
+    def set_hokm(self, suit: str, redis_manager=None, room_code=None) -> bool:
+        """Validate and set hokm suit with Redis persistence and broadcasting"""
         if self.game_phase != "hokm_selection":
+            print(f"[ERROR] Cannot set hokm in phase: {self.game_phase}. Expected: hokm_selection")
             return False
         
         if suit.lower() not in {'hearts', 'diamonds', 'clubs', 'spades'}:
+            print(f"[ERROR] Invalid hokm suit: {suit}")
             return False
         
+        print(f"[LOG] Setting hokm to {suit.lower()} and changing phase from {self.game_phase} to final_deal")
         self.hokm = suit.lower()
         self.game_phase = "final_deal"
+        
+        # Store hokm selection in Redis
+        if self.room_code and redis_manager:
+            try:
+                # Save game state with hokm selection
+                game_state = {
+                    'phase': self.game_phase,
+                    'hokm': self.hokm,
+                    'hakem': self.hakem,
+                    'last_activity': str(int(time.time()))
+                }
+                redis_manager.save_game_state(self.room_code, game_state)
+                
+                # Store room_code for future operations if provided externally
+                if room_code:
+                    self.room_code = room_code
+                
+            except Exception as e:
+                print(f"[WARNING] Failed to persist hokm selection: {str(e)}")
+        
         return True
 
-    def final_deal(self) -> Dict[str, List[str]]:
-        """Deal remaining 8 cards after hokm selection"""
+    def broadcast_hokm_selection(self, redis_manager, network_manager):
+        """Broadcast hokm selection to all players - call this from server.py"""
+        if not (redis_manager and hasattr(self, 'room_code') and self.room_code):
+            return
+            
+        try:
+            import asyncio
+            # Create the broadcast task
+            broadcast_data = {
+                'hokm': self.hokm,
+                'hakem': self.hakem,
+                'phase': self.game_phase,
+                'timestamp': str(int(time.time()))
+            }
+            
+            # This will be called from server.py with proper async context
+            print(f"📡 Broadcasting hokm selection '{self.hokm}' to room {self.room_code}")
+            return broadcast_data
+        except Exception as e:
+            print(f"[ERROR] Failed to prepare hokm broadcast: {str(e)}")
+            return None
+
+    def final_deal(self, redis_manager=None) -> Dict[str, List[str]]:
+        """Deal remaining 8 cards after hokm selection with Redis persistence"""
         if self.game_phase != "final_deal":
             raise ValueError("Invalid game phase for final deal")
         
@@ -125,6 +185,16 @@ class GameBoard:
                     self.hands[player].append(self.deck.pop(0))
         
         self.game_phase = "gameplay"
+        
+        # 🔥 NEW: Persist final deal state
+        if redis_manager and hasattr(self, 'room_code') and self.room_code:
+            try:
+                game_state = self.to_redis_dict()
+                redis_manager.save_game_state(self.room_code, game_state)
+                print(f"✅ Final deal saved to Redis for room {self.room_code}")
+            except Exception as e:
+                print(f"[WARNING] Failed to persist final deal: {str(e)}")
+        
         return {p: self.hands[p].copy() for p in self.players}
 
     def validate_play(self, player, card):
@@ -236,27 +306,48 @@ class GameBoard:
                     trick_winner = player
                     highest_value = value
         
-        # Update trick count
-        winner_team = self.teams[trick_winner]
-        self.tricks[winner_team] += 1
-        
-        # Prepare result
+        # update trick‐counts
+        winner_idx = self.teams[trick_winner]
+        self.tricks[winner_idx] += 1
+        self.completed_tricks += 1
+
+        # decide if this hand (13 tricks) is done
+        hand_done = (self.completed_tricks >= 13)
+
         result = {
             "trick_complete": True,
             "trick_winner": trick_winner,
-            "team_tricks": self.tricks.copy(),
+            "team_tricks": self.tricks.copy(),      # e.g. {0:8,1:5}
             "next_player": trick_winner,
-            "hand_complete": any(count >= 7 for count in self.tricks.values())
+            "hand_complete": hand_done
         }
-            
+        
         # Reset for next trick
         self.current_trick = []
         self.led_suit = None
         self.current_turn = self.players.index(trick_winner)
         
-        if result["hand_complete"]:
+        if hand_done:
+            # determine which team won this hand
+            # (tie goes to Hakem’s team or pick arbitrary)
+            if self.tricks[0] > self.tricks[1]:
+                hand_winner_idx = 0
+            else:
+                hand_winner_idx = 1
+
+            # record round score
+            self.round_scores[hand_winner_idx] += 1
+            result["round_winner"]  = hand_winner_idx + 1
+            result["round_scores"]  = self.round_scores.copy()
+
+            # check for game over (first to 7 hand‐wins)
+            if self.round_scores[hand_winner_idx] >= 7:
+                self.game_phase = "completed"
+                result["game_complete"] = True
+
+            # reset for next hand
             self._prepare_new_hand()
-        
+
         return result
 
     def _prepare_new_hand(self):
@@ -265,6 +356,7 @@ class GameBoard:
         self.hands = {p: [] for p in self.players}
         self.hokm = None
         self.tricks = {0: 0, 1: 0}
+        self.completed_tricks = 0
         self.current_trick = []
         self.led_suit = None
         self.game_phase = "initial_deal"
@@ -318,6 +410,8 @@ class GameBoard:
                 
                 # Game progress
                 'tricks': json.dumps(self.tricks),
+                'round_scores': json.dumps(self.round_scores),
+                'completed_tricks': str(self.completed_tricks),
                 'led_suit': self.led_suit or '',
                 'current_trick': json.dumps(self.current_trick),
                 'played_cards': json.dumps(self.played_cards),
@@ -327,6 +421,8 @@ class GameBoard:
                    for player, hand in self.hands.items()},
                 
                 # Metadata
+                'created_at': str(getattr(self, 'created_at', int(time.time()))),
+                'last_activity': str(int(time.time())),
                 'last_updated': str(int(time.time()))
             }
             return game_state
@@ -366,6 +462,10 @@ class GameBoard:
             # Restore game progress
             if 'tricks' in state_dict:
                 game.tricks = json.loads(state_dict['tricks'])
+            if 'round_scores' in state_dict:
+                game.round_scores = json.loads(state_dict['round_scores'])
+            if 'completed_tricks' in state_dict:
+                game.completed_tricks = int(state_dict['completed_tricks'])
             game.led_suit = state_dict.get('led_suit') or None
             if 'current_trick' in state_dict:
                 game.current_trick = json.loads(state_dict['current_trick'])
