@@ -7,10 +7,15 @@ import json
 import uuid
 import random
 import time
-from .network import NetworkManager
-from .game_board import GameBoard
-from .game_states import GameState
-from .redis_manager import RedisManager
+import os
+
+# Add current directory to Python path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from network import NetworkManager
+from game_board import GameBoard
+from game_states import GameState
+from redis_manager import RedisManager
 
 # Constants
 ROOM_SIZE = 4    # Single game storage system
@@ -482,7 +487,21 @@ class GameServer:
                 await self.network_manager.notify_error(websocket, "Invalid card play: card not in your hand.")
                 return
             # Play card and update state
-            result = game.play_card(player, card, self.redis_manager)
+            try:
+                result = game.play_card(player, card, self.redis_manager)
+            except ValueError as ve:
+                # This catches invalid game state errors (e.g., invalid trick resolution)
+                error_msg = f"Invalid game state during card play: {str(ve)}"
+                print(f"[ERROR] {error_msg}")
+                await self.network_manager.notify_error(websocket, "Game state error. Please restart the game.")
+                return
+            except Exception as e:
+                # Catch any other unexpected errors during card play
+                error_msg = f"Unexpected error during card play: {str(e)}"
+                print(f"[ERROR] {error_msg}")
+                await self.network_manager.notify_error(websocket, "Unexpected error. Please try again.")
+                return
+                
             # Handle invalid play (e.g., suit-follow violation)
             if not result.get('valid', True):
                 await self.network_manager.notify_error(websocket, result.get('message', 'Invalid move'))
@@ -518,16 +537,19 @@ class GameServer:
             
             # If trick complete, broadcast trick result and save state
             if result.get('trick_complete'):
-                await self.network_manager.broadcast_to_room(
-                    room_code,
-                    'trick_result',
-                    {
-                        'winner': result.get('trick_winner'),
-                        'team1_tricks': result.get('team_tricks', {}).get(0, 0),
-                        'team2_tricks': result.get('team_tricks', {}).get(1, 0)
-                    },
-                    self.redis_manager
-                )
+                try:
+                    await self.network_manager.broadcast_to_room(
+                        room_code,
+                        'trick_result',
+                        {
+                            'winner': result.get('trick_winner'),
+                            'team1_tricks': (result.get('team_tricks') or {}).get(0, 0),
+                            'team2_tricks': (result.get('team_tricks') or {}).get(1, 0)
+                        },
+                        self.redis_manager
+                    )
+                except Exception as e:
+                    print(f"[ERROR] trick_result broadcast failed: {e}")
                 # Save state after trick
                 game_state = game.to_redis_dict()
                 self.redis_manager.save_game_state(room_code, game_state)
@@ -555,25 +577,29 @@ class GameServer:
                     # Fix the winning_team calculation to prevent negative values
                     round_winner = result.get('round_winner', 1)  # Default to team 1 if missing
                     winning_team = max(0, round_winner - 1) if round_winner > 0 else 0  # Ensure it's 0 or 1, never negative
-                    
-                    # Broadcast hand completion with proper data types
-                    await self.network_manager.broadcast_to_room(
-                        room_code,
-                        'hand_complete',
-                        {
-                            'winning_team': winning_team,  # Always 0 or 1
-                            'tricks': result.get('team_tricks', {0: 0, 1: 0}),
-                            'round_winner': round_winner,  # Always 1 or 2
-                            'round_scores': result.get('round_scores', {0: 0, 1: 0}),
-                            'game_complete': result.get('game_complete', False)
-                        },
-                        self.redis_manager
-                    )
+                    # Coerce fields to safe JSON-serializable defaults
+                    team_tricks = result.get('team_tricks') or {0: 0, 1: 0}
+                    round_scores = result.get('round_scores') or {0: 0, 1: 0}
+                    try:
+                        await self.network_manager.broadcast_to_room(
+                            room_code,
+                            'hand_complete',
+                            {
+                                'winning_team': winning_team,
+                                'tricks': team_tricks,
+                                'round_winner': round_winner,
+                                'round_scores': round_scores,
+                                'game_complete': bool(result.get('game_complete', False))
+                            },
+                            self.redis_manager
+                        )
+                    except Exception as e:
+                        print(f"[ERROR] hand_complete broadcast failed: {e}")
                     # Save state after hand completion
                     game_state = game.to_redis_dict()
                     self.redis_manager.save_game_state(room_code, game_state)
 
-                    # Broadcast game_over if game is complete
+                    # Broadcast game_over if game is complete, otherwise start next round
                     if result.get('game_complete'):
                         await self.network_manager.broadcast_to_room(
                             room_code,
@@ -581,9 +607,19 @@ class GameServer:
                             {'winner_team': result.get('round_winner')},
                             self.redis_manager
                         )
+                    else:
+                        # Start next round after 3 seconds delay
+                        print(f"[LOG] Scheduling next round for room {room_code}")
+                        asyncio.create_task(self.start_next_round_delayed(room_code, 3.0))
         except Exception as e:
             print(f"[ERROR] Failed to handle play_card: {str(e)}")
-            await self.network_manager.notify_error(websocket, f"Failed to handle play_card: {str(e)}")
+            import traceback
+            traceback.print_exc()  # Print full stack trace for debugging
+            try:
+                await self.network_manager.notify_error(websocket, f"Failed to handle play_card: {str(e)}")
+            except Exception as notify_err:
+                print(f"[ERROR] Failed to notify play_card error: {notify_err}")
+                # Don't re-raise - just log and continue
 
     async def start_first_trick(self, room_code):
         """Initialize the first trick after hokm selection"""
@@ -698,6 +734,105 @@ class GameServer:
             print(f"[ERROR] Failed to repair connection for {username}: {str(e)}")
             return None
 
+    async def start_next_round_delayed(self, room_code, delay_seconds):
+        """Start next round after a delay"""
+        await asyncio.sleep(delay_seconds)
+        await self.start_next_round(room_code)
+
+    async def start_next_round(self, room_code):
+        """Start the next round with new hakem selection"""
+        try:
+            if room_code not in self.active_games:
+                print(f"[ERROR] Room {room_code} not found for next round")
+                return
+
+            game = self.active_games[room_code]
+            
+            if game.game_phase == "completed":
+                print(f"[LOG] Game in room {room_code} is already completed")
+                return
+
+            print(f"[LOG] Starting next round in room {room_code}")
+            
+            # Start new round (this handles hakem selection and initial deal)
+            initial_hands = game.start_new_round(self.redis_manager)
+            
+            if isinstance(initial_hands, dict) and "error" in initial_hands:
+                print(f"[ERROR] Failed to start new round: {initial_hands['error']}")
+                return
+
+            # Get round info for broadcast
+            round_info = game.get_new_round_info()
+            print(f"[LOG] Round info: {round_info}")
+            
+            # Broadcast phase change to hokm selection
+            await self.network_manager.broadcast_to_room(
+                room_code,
+                'phase_change',
+                {'new_phase': GameState.WAITING_FOR_HOKM.value},
+                self.redis_manager
+            )
+            
+            # Broadcast new round start to all players
+            await self.network_manager.broadcast_to_room(
+                room_code,
+                'new_round_start',
+                round_info,
+                self.redis_manager
+            )
+
+            # Send individual initial hands to each player
+            print(f"[LOG] Broadcasting initial hands: {list(initial_hands.keys())}")
+            await self.broadcast_initial_hands(room_code, initial_hands)
+
+            # Update game state in Redis
+            game_state = game.to_redis_dict()
+            self.redis_manager.save_game_state(room_code, game_state)
+
+            print(f"[LOG] Next round started successfully in room {room_code}")
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to start next round in room {room_code}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
+    async def broadcast_initial_hands(self, room_code, hands):
+        """Broadcast initial hands (5 cards) to players for hokm selection"""
+        try:
+            game = self.active_games[room_code]
+            
+            for player_name, hand in hands.items():
+                # Find the player info
+                room_players = self.redis_manager.get_room_players(room_code)
+                player_info = next((p for p in room_players if p['username'] == player_name), None)
+                
+                if player_info:
+                    is_hakem = (player_name == game.hakem)
+                    player_id = player_info['player_id']
+                    
+                    # Get the websocket connection for this player
+                    ws = self.network_manager.get_live_connection(player_id)
+                    if ws:
+                        await self.network_manager.send_message(
+                            ws,
+                            'initial_deal',
+                            {
+                                'hand': hand,
+                                'hakem': game.hakem,
+                                'is_hakem': is_hakem,
+                                'you': player_name,
+                                'phase': 'hokm_selection'
+                            }
+                        )
+                        print(f"[LOG] Sent initial hand to {player_name} (hakem: {is_hakem})")
+                    else:
+                        print(f"[ERROR] No websocket connection found for {player_name} (player_id: {player_id})")
+                        
+        except Exception as e:
+            print(f"[ERROR] Failed to broadcast initial hands: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
 async def cleanup_task():
     """Periodic task to cleanup expired sessions, inactive rooms, and stale connections"""
     while True:
@@ -756,17 +891,28 @@ async def main():
                     data = json.loads(message)
                     await game_server.handle_message(websocket, data)
                 except json.JSONDecodeError:
-                    await game_server.network_manager.notify_error(websocket, "Invalid message format")
+                    try:
+                        await game_server.network_manager.notify_error(websocket, "Invalid message format")
+                    except Exception as notify_err:
+                        print(f"[ERROR] Failed to notify JSON error: {notify_err}")
+                        # Continue the loop even if notification fails
                 except Exception as e:
                     print(f"[ERROR] Failed to process message: {str(e)}")
+                    import traceback
+                    traceback.print_exc()  # Print full stack trace for debugging
                     try:
                         await game_server.network_manager.notify_error(websocket, f"Internal server error: {str(e)}")
                     except Exception as notify_err:
                         print(f"[ERROR] Failed to notify user of connection error: {notify_err}")
+                        # Continue the loop even if notification fails
+                    # Don't break the loop - continue processing messages
         except websockets.ConnectionClosed:
+            print(f"[LOG] Connection closed for {websocket.remote_address}")
             await game_server.handle_connection_closed(websocket)
         except Exception as e:
             print(f"[ERROR] Connection handler error: {str(e)}")
+            import traceback
+            traceback.print_exc()
             try:
                 await game_server.network_manager.notify_error(websocket, f"Connection handler error: {str(e)}")
             except Exception as notify_err:

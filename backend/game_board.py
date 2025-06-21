@@ -18,6 +18,7 @@ class GameBoard:
         self.current_turn = 0
         self.tricks = {0: 0, 1: 0}          # current‐hand trick counts
         self.round_scores = {0: 0, 1: 0}   # number of hands won per team
+        self.player_tricks = {player: 0 for player in players}  # Individual player trick counts
         self.completed_tricks = 0         # count of tricks played in this hand
         self.hands = {player: [] for player in players}
         self.current_trick = []
@@ -287,6 +288,10 @@ class GameBoard:
 
     def _resolve_trick(self) -> Dict[str, Any]:
         """Determine trick winner and update game state"""
+        # Safety check: ensure current_trick has exactly 4 cards
+        if len(self.current_trick) != 4:
+            raise ValueError(f"Cannot resolve trick: expected 4 cards, got {len(self.current_trick)}")
+        
         trick_winner = None
         highest_value = -1
         trump_played = False
@@ -306,13 +311,18 @@ class GameBoard:
                     trick_winner = player
                     highest_value = value
         
+        # Safety check: ensure we found a winner
+        if trick_winner is None:
+            raise ValueError(f"No trick winner found for trick: {self.current_trick}")
+        
         # update trick‐counts
         winner_idx = self.teams[trick_winner]
         self.tricks[winner_idx] += 1
+        self.player_tricks[trick_winner] = self.player_tricks.get(trick_winner, 0) + 1  # Track individual player tricks
         self.completed_tricks += 1
 
-        # decide if this hand (13 tricks) is done
-        hand_done = (self.completed_tricks >= 13)
+        # decide if this hand is done - either team reaches 7 tricks OR all 13 tricks played
+        hand_done = (self.tricks[0] >= 7 or self.tricks[1] >= 7 or self.completed_tricks >= 13)
 
         result = {
             "trick_complete": True,
@@ -329,8 +339,13 @@ class GameBoard:
         
         if hand_done:
             # determine which team won this hand
-            # (tie goes to Hakem’s team or pick arbitrary)
-            if self.tricks[0] > self.tricks[1]:
+            # If a team reached 7 tricks, they automatically win
+            # Otherwise, compare trick counts (for the rare case all 13 tricks are played)
+            if self.tricks[0] >= 7:
+                hand_winner_idx = 0
+            elif self.tricks[1] >= 7:  
+                hand_winner_idx = 1
+            elif self.tricks[0] > self.tricks[1]:
                 hand_winner_idx = 0
             else:
                 hand_winner_idx = 1
@@ -340,27 +355,99 @@ class GameBoard:
             result["round_winner"]  = hand_winner_idx + 1
             result["round_scores"]  = self.round_scores.copy()
 
-            # check for game over (first to 7 hand‐wins)
+            # check for game over (first team to win 7 rounds)
             if self.round_scores[hand_winner_idx] >= 7:
                 self.game_phase = "completed"
                 result["game_complete"] = True
-
-            # reset for next hand
-            self._prepare_new_hand()
+            else:
+                # reset for next hand only if game is not complete
+                self._prepare_new_hand()
 
         return result
 
     def _prepare_new_hand(self):
-        """Reset state for new hand"""
+        """Reset state for new hand and select new hakem"""
+        # Select new hakem from winning team (player with most tricks)
+        hand_winner_team = 0 if self.tricks[0] > self.tricks[1] else 1
+        self._select_new_hakem(hand_winner_team)
+        
+        # Reset game state for new hand
         self.deck = self._create_deck()
         self.hands = {p: [] for p in self.players}
         self.hokm = None
         self.tricks = {0: 0, 1: 0}
+        self.player_tricks = {p: 0 for p in self.players}  # Reset individual player tricks
         self.completed_tricks = 0
         self.current_trick = []
         self.led_suit = None
         self.game_phase = "initial_deal"
         self.played_cards = []
+        
+        # Set starting turn to new hakem
+        self.current_turn = self.players.index(self.hakem)
+
+    def _select_new_hakem(self, winning_team):
+        """Select new hakem from winning team - player with most tricks"""
+        # Get players from winning team
+        winning_team_players = [p for p in self.players if self.teams[p] == winning_team]
+        
+        # Find the player with the most tricks from the winning team
+        max_tricks = -1
+        new_hakem = None
+        for player in winning_team_players:
+            if self.player_tricks.get(player, 0) > max_tricks:
+                max_tricks = self.player_tricks.get(player, 0)
+                new_hakem = player
+        
+        # Fallback in case of a tie or other issues
+        if new_hakem is None:
+            # Select the first player from winning team
+            new_hakem = winning_team_players[0]
+            
+        self.hakem = new_hakem
+        print(f"[LOG] New hakem selected: {self.hakem} from winning team {winning_team} with {max_tricks} tricks")
+
+    def start_new_round(self, redis_manager=None):
+        """Start a new round with proper hakem selection and initial deal"""
+        if self.game_phase == "completed":
+            return {"error": "Game is already completed"}
+        
+        print(f"[LOG] Starting new round. Current hakem: {self.hakem}")
+        
+        # Select new hakem from winning team (based on previous round results)
+        winning_team = 0 if self.tricks[0] > self.tricks[1] else 1
+        self._select_new_hakem(winning_team)
+        
+        # Reset for new round but keep round scores
+        self.deck = self._create_deck()
+        self.hands = {p: [] for p in self.players}
+        self.hokm = None
+        self.tricks = {0: 0, 1: 0}
+        self.player_tricks = {p: 0 for p in self.players}
+        self.completed_tricks = 0
+        self.current_trick = []
+        self.led_suit = None
+        self.played_cards = []
+        
+        # Set starting turn to new hakem
+        self.current_turn = self.players.index(self.hakem)
+        
+        # Ensure we're in the right phase
+        self.game_phase = "initial_deal"
+        
+        # Deal initial 5 cards
+        return self.initial_deal()
+
+    def get_new_round_info(self):
+        """Get information for new round broadcast"""
+        round_number = sum(self.round_scores.values()) + 1
+        return {
+            "type": "new_round_start",
+            "hakem": self.hakem,
+            "round_number": round_number,
+            "team_scores": self.round_scores.copy(),
+            "phase": self.game_phase
+        }
 
     def _card_value(self, rank: str) -> int:
         """Get numeric value for card comparison"""

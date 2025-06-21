@@ -5,7 +5,11 @@ import json
 import sys
 import random
 import os
-from .game_states import GameState
+
+# Add current directory to Python path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from game_states import GameState
 
 
 SERVER_URI = "ws://localhost:8765"
@@ -193,6 +197,7 @@ async def main():
                 if msg_type == 'error':
                     error_msg = data.get('message', 'Unknown error')
                     print(f"\n❌ Error: {error_msg}")
+                    print(f"[DEBUG] Error handler state - your_turn: {your_turn}, last_turn_hand: {last_turn_hand is not None}, hand: {hand is not None}")
                     
                     # Handle connection/player not found errors
                     if ("Player not found in room" in error_msg or 
@@ -207,55 +212,61 @@ async def main():
                         continue
                     
                     # Handle suit-following errors by re-prompting for card selection
-                    if "You must follow suit" in error_msg and your_turn and last_turn_hand:
-                        print("\nPlease select a valid card that follows suit:")
-                        sorted_hand = sort_hand(last_turn_hand, hokm)
-                        for idx, card in enumerate(sorted_hand, 1):
-                            print(f"{idx}. {card}")
-                        
-                        print("(Type 'exit' to clear room and exit)")
-                        while True:
-                            try:
-                                choice = input(f"Select a card to play (1-{len(sorted_hand)}) or 'exit': ")
-                                print(f"[DEBUG] Error re-prompt - User input: '{choice}', Hand size: {len(sorted_hand)}")
-                                
-                                if choice.lower() == 'exit':
-                                    print("Sending command to clear room and exiting...")
-                                    await ws.send(json.dumps({
-                                        'type': 'clear_room',
-                                        'room_code': room_code
-                                    }))
-                                    print("Room cleared. Exiting client.")
-                                    await ws.close()
-                                    return
+                    if "You must follow suit" in error_msg:
+                        # Use current hand if last_turn_hand is not available
+                        current_hand = last_turn_hand if last_turn_hand else hand
+                        if current_hand:
+                            print("\nPlease select a valid card that follows suit:")
+                            sorted_hand = sort_hand(current_hand, hokm)
+                            for idx, card in enumerate(sorted_hand, 1):
+                                print(f"{idx}. {card}")
+                            
+                            print("(Type 'exit' to clear room and exit)")
+                            while True:
+                                try:
+                                    choice = input(f"Select a card to play (1-{len(sorted_hand)}) or 'exit': ")
+                                    print(f"[DEBUG] Error re-prompt - User input: '{choice}', Hand size: {len(sorted_hand)}")
                                     
-                                card_idx = int(choice) - 1
-                                print(f"[DEBUG] Error re-prompt - Calculated card_idx: {card_idx}, Valid range: 0 to {len(sorted_hand)-1}")
-                                
-                                if 0 <= card_idx < len(sorted_hand):
-                                    card = sorted_hand[card_idx]
-                                    print(f"[DEBUG] Error re-prompt - Selected card: {card}")
-                                    await ws.send(json.dumps({
-                                        "type": "play_card",
-                                        "room_code": room_code,
-                                        "player_id": player_id,
-                                        "card": card
-                                    }))
-                                    break
-                                else:
-                                    print(f"❌ Please enter a number between 1 and {len(sorted_hand)} or 'exit'")
-                            except ValueError as ve:
-                                print(f"[DEBUG] Error re-prompt - ValueError: {ve}")
-                                if choice.lower() == 'exit':
-                                    print("Sending command to clear room and exiting...")
-                                    await ws.send(json.dumps({
-                                        'type': 'clear_room',
-                                        'room_code': room_code
-                                    }))
-                                    print("Room cleared. Exiting client.")
-                                    await ws.close()
-                                    return
-                                print(f"❌ Please enter a valid number or 'exit'")
+                                    if choice.lower() == 'exit':
+                                        print("Sending command to clear room and exiting...")
+                                        await ws.send(json.dumps({
+                                            'type': 'clear_room',
+                                            'room_code': room_code
+                                        }))
+                                        print("Room cleared. Exiting client.")
+                                        await ws.close()
+                                        return
+                                        
+                                    card_idx = int(choice) - 1
+                                    print(f"[DEBUG] Error re-prompt - Calculated card_idx: {card_idx}, Valid range: 0 to {len(sorted_hand)-1}")
+                                    
+                                    if 0 <= card_idx < len(sorted_hand):
+                                        card = sorted_hand[card_idx]
+                                        print(f"[DEBUG] Error re-prompt - Selected card: {card}")
+                                        await ws.send(json.dumps({
+                                            "type": "play_card",
+                                            "room_code": room_code,
+                                            "player_id": player_id,
+                                            "card": card
+                                        }))
+                                        break
+                                    else:
+                                        print(f"❌ Please enter a number between 1 and {len(sorted_hand)} or 'exit'")
+                                except ValueError as ve:
+                                    print(f"[DEBUG] Error re-prompt - ValueError: {ve}")
+                                    if choice.lower() == 'exit':
+                                        print("Sending command to clear room and exiting...")
+                                        await ws.send(json.dumps({
+                                            'type': 'clear_room',
+                                            'room_code': room_code
+                                        }))
+                                        print("Room cleared. Exiting client.")
+                                        await ws.close()
+                                        return
+                                    print(f"❌ Please enter a valid number or 'exit'")
+                        else:
+                            print(f"❌ Error: {error_msg}")
+                            print("Unable to re-prompt - hand data not available. Please try reconnecting.")
                     continue
 
                 # Handle join success - extract and save player_id
@@ -488,12 +499,12 @@ async def main():
                     try:
                         winning_team = data['winning_team'] + 1
                         
-                        # Handle tricks data - it might be a dict {0: count, 1: count} or a list
+                        # Handle tricks data - convert string keys to integers
                         tricks_data = data.get('tricks', {})
                         if isinstance(tricks_data, dict):
-                            # Server sends {0: count, 1: count}
-                            tricks_team1 = tricks_data.get(0, 0)
-                            tricks_team2 = tricks_data.get(1, 0)
+                            # Server sends {'0': count, '1': count} - convert to int
+                            tricks_team1 = int(tricks_data.get('0', 0)) if '0' in tricks_data else int(tricks_data.get(0, 0))
+                            tricks_team2 = int(tricks_data.get('1', 0)) if '1' in tricks_data else int(tricks_data.get(1, 0))
                         else:
                             # Fallback for list format
                             tricks_team1 = tricks_data[0] if len(tricks_data) > 0 else 0
@@ -504,14 +515,19 @@ async def main():
                         print(f"Final trick count:")
                         print(f"Team 1: {tricks_team1} tricks")
                         print(f"Team 2: {tricks_team2} tricks")
+                        
                         # Display round summary if available
                         if 'round_scores' in data:
                             scores = data.get('round_scores', {})
+                            # Handle string keys for round_scores too
+                            team1_rounds = int(scores.get('0', 0)) if '0' in scores else int(scores.get(0, 0))
+                            team2_rounds = int(scores.get('1', 0)) if '1' in scores else int(scores.get(1, 0))
                             print("\nRound Score:")
-                            print(f"Team 1: {scores.get(0, 0)} hands")
-                            print(f"Team 2: {scores.get(1, 0)} hands")
+                            print(f"Team 1: {team1_rounds} hands")
+                            print(f"Team 2: {team2_rounds} hands")
                         print(f"Round {round_number} finished\n")
                         round_number += 1  # Increment for next round
+                        
                         # If game is complete, notify
                         if data.get('game_complete'):
                             print("🎉 Game Over! 🎉")
@@ -521,6 +537,47 @@ async def main():
                             break
                     except Exception as hand_error:
                         print(f"❌ Error processing hand_complete: {hand_error}")
+                        print(f"[DEBUG] Data received: {data}")
+                        continue
+
+                elif data.get('type') == 'new_round_start':
+                    try:
+                        round_number = data.get('round_number', 1)
+                        hakem = data.get('hakem', 'Unknown')
+                        team_scores = data.get('team_scores', {0: 0, 1: 0})
+                        you = data.get('you', username)
+                        new_phase = data.get('phase', 'hokm_selection')
+                        
+                        # Update the current state from the new round info
+                        if new_phase == 'hokm_selection':
+                            current_state = GameState.WAITING_FOR_HOKM
+                        elif new_phase == 'gameplay':
+                            current_state = GameState.GAMEPLAY
+                        elif new_phase == 'final_deal':
+                            current_state = GameState.FINAL_DEAL
+                        
+                        print(f"\n{'='*50}")
+                        print(f"🎯 ROUND {round_number} STARTING 🎯")
+                        print(f"{'='*50}")
+                        print(f"New Hakem: {format_player_name(hakem, you)}")
+                        
+                        # Show current game score
+                        team1_score = int(team_scores.get('0', 0)) if '0' in team_scores else int(team_scores.get(0, 0))
+                        team2_score = int(team_scores.get('1', 0)) if '1' in team_scores else int(team_scores.get(1, 0))
+                        print(f"Game Score - Team 1: {team1_score} | Team 2: {team2_score}")
+                        
+                        if hakem == you:
+                            print("🎖️  YOU ARE THE HAKEM! 🎖️")
+                            print("You will choose the Hokm (trump suit) after seeing your first 5 cards.")
+                            await_hokm_selection = True  # Set flag for hokm selection
+                        else:
+                            print(f"{format_player_name(hakem, you)} is the Hakem and will choose Hokm.")
+                        
+                        print("Waiting for initial cards...")
+                        print("-" * 50)
+                        
+                    except Exception as round_error:
+                        print(f"❌ Error processing new_round_start: {round_error}")
                         print(f"[DEBUG] Data received: {data}")
                         continue
 

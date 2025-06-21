@@ -3,6 +3,8 @@ import asyncio
 import json
 import websockets
 import time
+import sys
+import os
 from typing import Optional, Dict, Any
 try:
     from websockets.legacy.server import WebSocketServerProtocol
@@ -12,7 +14,10 @@ except ImportError:
     except ImportError:
         WebSocketServerProtocol = Any
 
-from .redis_manager import RedisManager
+# Add current directory to Python path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from redis_manager import RedisManager
 
 class NetworkManager:
     _instance = None
@@ -89,14 +94,23 @@ class NetworkManager:
                 # Get live connection for player if it exists
                 ws = self.get_live_connection(player_id)
                 if ws:
-                    # Customize message for player if needed
-                    player_data = data.copy()
-                    player_data.update({
-                        'you': player.get('username'),
-                        'player_number': player.get('player_number', 0)
-                    })
-                    
-                    await self.send_message(ws, msg_type, player_data)
+                    try:
+                        # Customize message for player if needed
+                        player_data = data.copy()
+                        player_data.update({
+                            'you': player.get('username'),
+                            'player_number': player.get('player_number', 0)
+                        })
+                        
+                        success = await self.send_message(ws, msg_type, player_data)
+                        if not success:
+                            print(f"[WARNING] Failed to send message to {player.get('username')}")
+                            # Remove failed connection
+                            self.remove_connection(ws)
+                    except Exception as e:
+                        print(f"[ERROR] Failed to send message to player {player.get('username')}: {str(e)}")
+                        # Remove failed connection
+                        self.remove_connection(ws)
                 else:
                     print(f"[INFO] Player {player.get('username')} has no live connection")
                     
