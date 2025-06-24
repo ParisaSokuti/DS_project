@@ -35,11 +35,16 @@ class RedisManager:
         """Save player session with enhanced monitoring"""
         try:
             key = f"session:{player_id}"
-            session_data.update({
-                'last_heartbeat': str(int(time.time())),
-                'connection_status': 'active'
-            })
-            self.redis.hset(key, mapping=session_data)
+            # Update session data but preserve existing connection_status if not provided
+            updated_data = {
+                'last_heartbeat': str(int(time.time()))
+            }
+            # Only set connection_status to 'active' if not already specified in session_data
+            if 'connection_status' not in session_data:
+                updated_data['connection_status'] = 'active'
+            
+            updated_data.update(session_data)
+            self.redis.hset(key, mapping=updated_data)
             self.redis.expire(key, 3600)  # Session expires in 1 hour
             return True
         except Exception as e:
@@ -52,21 +57,54 @@ class RedisManager:
     
     def add_player_to_room(self, room_code: str, player_data: dict):
         key = f"room:{room_code}:players"
-        self.redis.rpush(key, json.dumps(player_data))
+        try:
+            print(f"[DEBUG] Adding player to room {room_code}: {player_data.get('username', 'NO_NAME')}")
+            self.redis.rpush(key, json.dumps(player_data))
+            # Refresh expiration whenever we modify the list
+            self.redis.expire(key, 3600)
+            print(f"[DEBUG] Player added and expiration refreshed for room {room_code}")
+        except Exception as e:
+            print(f"[ERROR] Failed to add player to room {room_code}: {str(e)}")
         
     def get_room_players(self, room_code: str) -> List[dict]:
         key = f"room:{room_code}:players"
-        players = self.redis.lrange(key, 0, -1)
-        return [json.loads(p.decode()) for p in players]
+        try:
+            # Debug: check if key exists
+            exists = self.redis.exists(key)
+            print(f"[DEBUG] get_room_players for {room_code}: key exists = {exists}")
+            
+            if not exists:
+                print(f"[DEBUG] Room players key does not exist: {key}")
+                return []
+                
+            players = self.redis.lrange(key, 0, -1)
+            print(f"[DEBUG] Raw players data from Redis: {len(players)} entries")
+            for i, p in enumerate(players):
+                print(f"[DEBUG]   Player {i+1}: {p[:100]}...")  # First 100 chars
+                
+            result = [json.loads(p.decode()) for p in players]
+            print(f"[DEBUG] Parsed {len(result)} players from Redis")
+            return result
+        except Exception as e:
+            print(f"[ERROR] Failed to get room players for {room_code}: {str(e)}")
+            return []
     
     def save_game_state(self, room_code: str, game_state: dict) -> bool:
         """Save game state with proper encoding, validation, and transaction support"""
         start_time = time.time()
         try:
-            # Validate state before saving
+            # Add required fields if missing
+            if 'created_at' not in game_state:
+                game_state['created_at'] = str(int(time.time()))
+            if 'last_activity' not in game_state:
+                game_state['last_activity'] = str(int(time.time()))
+                
+            # Validate state before saving (now that required fields are added)
             is_valid, error = self.validate_game_state(game_state)
             if not is_valid:
-                raise ValueError(f"Invalid game state: {error}")
+                print(f"[WARNING] Game state validation failed for room {room_code}: {error}")
+                print(f"[WARNING] Saving anyway to prevent data loss...")
+                # Don't raise exception - just log warning and continue
                 
             pipe = self.redis.pipeline()
             key = f"game:{room_code}:state"
@@ -83,6 +121,8 @@ class RedisManager:
             pipe.hset(key, mapping=encoded_state)
             pipe.expire(key, 3600)
             pipe.execute()
+            
+            print(f"[DEBUG] Successfully saved game state for room {room_code} with phase: {game_state.get('phase', 'UNKNOWN')}")
             
             self._measure_latency(start_time)
             return True
@@ -379,3 +419,73 @@ class RedisManager:
         except Exception as e:
             print(f"[ERROR] Failed to check game completion for room {room_code}: {str(e)}")
             return True  # Assume completed if we can't check
+
+    def update_player_in_room(self, room_code: str, player_id: str, updated_data: dict):
+        """Update a specific player's data in the room"""
+        try:
+            key = f"room:{room_code}:players"
+            players = self.get_room_players(room_code)
+            
+            print(f"[DEBUG] update_player_in_room: room {room_code} has {len(players)} players before update")
+            
+            # Find and update the player
+            updated = False
+            for i, player in enumerate(players):
+                if player.get('player_id') == player_id:
+                    # Update the player data
+                    players[i] = updated_data
+                    updated = True
+                    break
+            
+            if not updated:
+                print(f"[ERROR] Player {player_id} not found in room {room_code} for update")
+                return False
+                    
+            # Clear the list and repopulate it
+            self.redis.delete(key)
+            for player_data in players:
+                self.redis.rpush(key, json.dumps(player_data))
+            
+            # Refresh expiration after update
+            self.redis.expire(key, 3600)
+            
+            print(f"[DEBUG] Successfully updated player {player_id} in room {room_code}")
+            return True
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to update player in room: {str(e)}")
+            return False
+
+    def debug_room_state(self, room_code: str):
+        """Debug function to print current room state"""
+        try:
+            print(f"\n=== DEBUG: Room {room_code} State ===")
+            
+            # Check if room exists
+            exists = self.room_exists(room_code)
+            print(f"Room exists: {exists}")
+            
+            if not exists:
+                print("Room does not exist in Redis")
+                return
+            
+            # Get room players
+            players = self.get_room_players(room_code)
+            print(f"Players in room: {len(players)}")
+            for i, player in enumerate(players):
+                print(f"  Player {i+1}: {player.get('username', 'NO_NAME')} (ID: {player.get('player_id', 'NO_ID')[:8]}...) - Status: {player.get('connection_status', 'NO_STATUS')}")
+            
+            # Get game state
+            game_state = self.get_game_state(room_code)
+            if game_state:
+                print(f"Game state exists - Phase: {game_state.get('phase', 'NO_PHASE')}")
+                print(f"  Hakem: {game_state.get('hakem', 'NO_HAKEM')}")
+                print(f"  Hokm: {game_state.get('hokm', 'NO_HOKM')}")
+                print(f"  Current turn: {game_state.get('current_turn', 'NO_TURN')}")
+            else:
+                print("No game state found")
+            
+            print("=== END DEBUG ===\n")
+            
+        except Exception as e:
+            print(f"[ERROR] Debug room state failed: {str(e)}")

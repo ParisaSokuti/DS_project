@@ -263,6 +263,8 @@ class NetworkManager:
             metadata = self.connection_metadata[websocket]
             player_id = metadata['player_id']
             
+            print(f"[DEBUG] Starting disconnect handling for player_id: {player_id[:8]}... in room: {room_code}")
+            
             # 2. Get player info from Redis
             session = redis_manager.get_player_session(player_id)
             if not session:
@@ -271,6 +273,12 @@ class NetworkManager:
                 return False
                 
             username = session.get('username')
+            
+            print(f"[DEBUG] Player {username} (ID: {player_id[:8]}...) disconnecting from room {room_code}")
+            
+            # DEBUG: Check room state before making any changes
+            print(f"[DEBUG] Before disconnect processing:")
+            redis_manager.debug_room_state(room_code)
             
             # 3. Update session in Redis
             disconnect_data = {
@@ -282,19 +290,42 @@ class NetworkManager:
             }
             redis_manager.save_player_session(player_id, disconnect_data)
             
-            # 4. Remove live connection
+            # 4. Update room player data to mark as disconnected
+            room_players = redis_manager.get_room_players(room_code)
+            print(f"[DEBUG] Room {room_code} currently has {len(room_players)} players:")
+            for i, player in enumerate(room_players):
+                print(f"[DEBUG]   Player {i+1}: {player.get('username', 'NO_NAME')} (ID: {player.get('player_id', 'NO_ID')[:8]}...) - Status: {player.get('connection_status', 'NO_STATUS')}")
+            
+            player_found = False
+            for i, player in enumerate(room_players):
+                if player.get('player_id') == player_id:
+                    room_players[i]['connection_status'] = 'disconnected'
+                    room_players[i]['disconnected_at'] = str(int(time.time()))
+                    # Update the room player list
+                    update_result = redis_manager.update_player_in_room(room_code, player_id, room_players[i])
+                    print(f"[DEBUG] Updated player {username} status to disconnected. Update result: {update_result}")
+                    player_found = True
+                    break
+            
+            if not player_found:
+                print(f"[ERROR] Player {player_id[:8]}... not found in room {room_code} players list!")
+                
+            # 5. Remove live connection
             self.remove_connection(websocket)
             
-            # 5. Save game state if in active game
+            # 6. Save game state if in active game
             game_state = redis_manager.get_game_state(room_code)
             if game_state:
                 game_state['last_activity'] = str(int(time.time()))
                 redis_manager.save_game_state(room_code, game_state)
+                print(f"[DEBUG] Updated game state for room {room_code}")
+            else:
+                print(f"[DEBUG] No game state found for room {room_code}")
             
             print(f"[LOG] Player {username} disconnected from room {room_code}")
             print(f"[DEBUG] Remaining connections: {len(self.live_connections)}")
             
-            # 6. Notify other players with remaining connection count
+            # 7. Notify other players with remaining connection count
             await self.broadcast_to_room(
                 room_code,
                 'player_disconnected',
@@ -306,8 +337,13 @@ class NetworkManager:
                 redis_manager
             )
             
+            # 8. Final verification - check if player is still in room
+            updated_room_players = redis_manager.get_room_players(room_code)
+            print(f"[DEBUG] After disconnect handling, room {room_code} has {len(updated_room_players)} players:")
+            for i, player in enumerate(updated_room_players):
+                print(f"[DEBUG]   Player {i+1}: {player.get('username', 'NO_NAME')} (ID: {player.get('player_id', 'NO_ID')[:8]}...) - Status: {player.get('connection_status', 'NO_STATUS')}")
+            
             return True
-
         except Exception as e:
             print(f"[ERROR] Failed to handle player disconnection: {str(e)}")
             # Clean up connection anyway
@@ -323,7 +359,9 @@ class NetworkManager:
             })
             
             if not is_valid:
-                await self.notify_error(websocket, session.get('error', 'Failed to reconnect'))
+                error_msg = session.get('error', 'Failed to reconnect')
+                print(f"[DEBUG] Reconnection failed for {player_id[:8]}...: {error_msg}")
+                await self.notify_error(websocket, error_msg)
                 return False
                 
             room_code = session.get('room_code')
@@ -331,6 +369,42 @@ class NetworkManager:
             
             if not room_code or not username:
                 await self.notify_error(websocket, "Invalid session data")
+                return False
+            
+            # Additional validation: Check if player is actually in the room and disconnected
+            room_players = redis_manager.get_room_players(room_code)
+            player_in_room = None
+            
+            print(f"[DEBUG] Reconnection validation for player_id: {player_id}")
+            
+            # Debug room state
+            redis_manager.debug_room_state(room_code)
+            
+            print(f"[DEBUG] Room {room_code} has {len(room_players)} players:")
+            for i, player in enumerate(room_players):
+                print(f"[DEBUG]   Player {i+1}: {player.get('player_id', 'NO_ID')[:8]}... ({player.get('username', 'NO_NAME')}) - {player.get('connection_status', 'NO_STATUS')}")
+                if player.get('player_id') == player_id:
+                    player_in_room = player
+                    break
+            
+            if not player_in_room:
+                print(f"[DEBUG] Player {player_id[:8]}... not found in room {room_code}")
+                
+                # Check if room exists at all
+                if not redis_manager.room_exists(room_code):
+                    await self.notify_error(websocket, "Game room no longer exists. The game may have ended or been cancelled.")
+                    return False
+                
+                # Check if there's an active game but player is not in it
+                game_state = redis_manager.get_game_state(room_code)
+                if game_state:
+                    await self.notify_error(websocket, "Game is active but your player slot is no longer available. The game may have been restarted.")
+                else:
+                    await self.notify_error(websocket, "No active game found. Please join a new game.")
+                return False
+            
+            if player_in_room.get('connection_status') == 'active':
+                await self.notify_error(websocket, "Player is already connected")
                 return False
             
             # 2. Register new connection
@@ -342,19 +416,39 @@ class NetworkManager:
                 game_state = {}
             
             # 4. Send reconnection success with full state
-            teams = json.loads(game_state.get('teams', '{}'))
+            # Handle JSON parsing safely - data might already be parsed from Redis
+            teams_data = game_state.get('teams', '{}')
+            if isinstance(teams_data, str):
+                teams = json.loads(teams_data)
+            else:
+                teams = teams_data
+                
+            hand_data = game_state.get(f'hand_{username}', '[]')
+            if isinstance(hand_data, str):
+                hand = json.loads(hand_data)
+            else:
+                hand = hand_data
+                
+            print(f"[DEBUG] Reconnection: Player {username} hand has {len(hand)} cards from Redis")
+                
+            tricks_data = game_state.get('tricks', '{}')
+            if isinstance(tricks_data, str):
+                tricks = json.loads(tricks_data)
+            else:
+                tricks = tricks_data
+                
             restored_state = {
                 'username': username,
                 'room_code': room_code,
                 'player_id': player_id,
                 'game_state': {
-                    'phase': game_state.get('game_phase', 'waiting'),
+                    'phase': game_state.get('phase', game_state.get('game_phase', 'waiting')),  # Try both 'phase' and 'game_phase'
                     'teams': teams,
                     'hakem': game_state.get('hakem'),
                     'hokm': game_state.get('hokm'),
-                    'hand': json.loads(game_state.get(f'hand_{username}', '[]')),
+                    'hand': hand,
                     'current_turn': int(game_state.get('current_turn', 0)),
-                    'tricks': json.loads(game_state.get('tricks', '{}')),
+                    'tricks': tricks,
                     'you': username,
                     'your_team': "1" if username in teams.get('1', []) else "2"
                 }
@@ -365,7 +459,44 @@ class NetworkManager:
             print(f"[LOG] Player {username} reconnected to room {room_code}")
             print(f"[DEBUG] Active connections: {len(self.live_connections)}")
             
-            # 5. Notify other players
+            # 5. Check if reconnected player is hakem and needs to choose hokm
+            current_phase = game_state.get('phase', game_state.get('game_phase', 'waiting'))
+            current_hakem = game_state.get('hakem')
+            current_hokm = game_state.get('hokm', '')
+            
+            if (current_phase == 'hokm_selection' and 
+                current_hakem == username and 
+                not current_hokm):
+                print(f"[LOG] Reconnected hakem {username} needs to choose hokm")
+                await self.send_message(websocket, 'hokm_request', {
+                    'message': 'You are the Hakem. Choose hokm (hearts, diamonds, clubs, spades).',
+                    'hand': hand
+                })
+            elif current_phase == 'gameplay':
+                # Player reconnected during gameplay - send current turn info
+                print(f"[LOG] Player {username} reconnected during gameplay")
+                current_turn = int(game_state.get('current_turn', 0))
+                players = json.loads(game_state.get('players', '[]')) if isinstance(game_state.get('players'), str) else game_state.get('players', [])
+                
+                if players and current_turn < len(players):
+                    current_player = players[current_turn]
+                    await self.send_message(websocket, 'turn_start', {
+                        'current_player': current_player,
+                        'your_turn': username == current_player,
+                        'hand': hand,
+                        'hokm': current_hokm,
+                        'message': f'Game in progress. {current_player}\'s turn.'
+                    })
+            elif current_phase in ['final_deal']:
+                # Player reconnected during final deal phase - send their full hand
+                print(f"[LOG] Player {username} reconnected during final deal")
+                await self.send_message(websocket, 'final_deal', {
+                    'hand': hand,
+                    'hokm': current_hokm,
+                    'message': f'Final deal completed. You have {len(hand)} cards.'
+                })
+            
+            # 6. Notify other players
             await self.broadcast_to_room(
                 room_code,
                 'player_reconnected',

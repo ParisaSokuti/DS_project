@@ -485,8 +485,8 @@ class GameBoard:
         """
         try:
             game_state = {
-                # Basic game state
-                'game_phase': self.game_phase,
+                # Basic game state - use 'phase' to match Redis validation
+                'phase': self.game_phase,
                 'hokm': self.hokm or '',
                 'hakem': self.hakem or '',
                 

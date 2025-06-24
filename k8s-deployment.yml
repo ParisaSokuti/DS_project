@@ -1,0 +1,441 @@
+# Kubernetes Deployment Configuration for Horizontal Scaling
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hokm-game
+  labels:
+    name: hokm-game
+
+---
+# Redis Master Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-master
+  namespace: hokm-game
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-master
+  template:
+    metadata:
+      labels:
+        app: redis-master
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.2-alpine
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: redis-config
+          mountPath: /usr/local/etc/redis/redis.conf
+          subPath: redis.conf
+        command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+      volumes:
+      - name: redis-config
+        configMap:
+          name: redis-config
+
+---
+# Redis Master Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-master
+  namespace: hokm-game
+spec:
+  selector:
+    app: redis-master
+  ports:
+  - port: 6379
+    targetPort: 6379
+  type: ClusterIP
+
+---
+# Game Server Deployment with HPA
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hokm-server
+  namespace: hokm-game
+  labels:
+    app: hokm-server
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hokm-server
+  template:
+    metadata:
+      labels:
+        app: hokm-server
+    spec:
+      containers:
+      - name: hokm-server
+        image: hokm-game:latest
+        ports:
+        - containerPort: 8001
+        env:
+        - name: REDIS_HOST
+          value: "redis-master"
+        - name: REDIS_PORT
+          value: "6379"
+        - name: PORT
+          value: "8001"
+        - name: INSTANCE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "kill -TERM 1"]
+
+---
+# Game Server Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: hokm-server
+  namespace: hokm-game
+spec:
+  selector:
+    app: hokm-server
+  ports:
+  - port: 8001
+    targetPort: 8001
+  type: ClusterIP
+
+---
+# Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: hokm-server-hpa
+  namespace: hokm-game
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: hokm-server
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  - type: Pods
+    pods:
+      metric:
+        name: websocket_connections
+      target:
+        type: AverageValue
+        averageValue: "100"
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 25
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+      - type: Pods
+        value: 2
+        periodSeconds: 60
+
+---
+# NGINX Ingress Controller with WebSocket Support
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hokm-ingress
+  namespace: hokm-game
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/websocket-services: "hokm-server"
+    nginx.ingress.kubernetes.io/session-affinity: "consistent-hash"
+    nginx.ingress.kubernetes.io/session-affinity-mode: "persistent"
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$arg_room_code"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  tls:
+  - hosts:
+    - hokm.yourdomain.com
+    secretName: hokm-tls
+  rules:
+  - host: hokm.yourdomain.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: hokm-server
+            port:
+              number: 8001
+
+---
+# ConfigMap for Redis Configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: hokm-game
+data:
+  redis.conf: |
+    bind 0.0.0.0
+    port 6379
+    tcp-backlog 511
+    timeout 0
+    tcp-keepalive 300
+    daemonize no
+    supervised no
+    pidfile /var/run/redis_6379.pid
+    loglevel notice
+    logfile ""
+    databases 16
+    always-show-logo yes
+    save 900 1
+    save 300 10
+    save 60 10000
+    stop-writes-on-bgsave-error yes
+    rdbcompression yes
+    rdbchecksum yes
+    dbfilename dump.rdb
+    rdb-del-sync-files no
+    dir ./
+    maxmemory 256mb
+    maxmemory-policy allkeys-lru
+
+---
+# Custom Metrics for Game-Specific Scaling
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: custom-metrics-config
+  namespace: hokm-game
+data:
+  metrics.yaml: |
+    rules:
+    - name: websocket_connections
+      query: sum(hokm_websocket_connections) by (pod)
+      interval: 30s
+    - name: active_games
+      query: sum(hokm_active_games) by (pod)
+      interval: 30s
+    - name: game_creation_rate
+      query: rate(hokm_games_created_total[5m])
+      interval: 30s
+    - name: player_queue_length
+      query: hokm_player_queue_length
+      interval: 30s
+
+---
+# ServiceMonitor for Prometheus
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: hokm-server-metrics
+  namespace: hokm-game
+spec:
+  selector:
+    matchLabels:
+      app: hokm-server
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+
+---
+# NetworkPolicy for Security
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hokm-network-policy
+  namespace: hokm-game
+spec:
+  podSelector:
+    matchLabels:
+      app: hokm-server
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8001
+  - from:
+    - podSelector:
+        matchLabels:
+          app: hokm-server
+    ports:
+    - protocol: TCP
+      port: 8001
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis-master
+    ports:
+    - protocol: TCP
+      port: 6379
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53
+
+---
+# PodDisruptionBudget
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hokm-server-pdb
+  namespace: hokm-game
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: hokm-server
+
+---
+# Custom Resource for Game-Aware Scaling
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: gameautoscalers.autoscaling.hokm.io
+spec:
+  group: autoscaling.hokm.io
+  versions:
+  - name: v1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              scaleTargetRef:
+                type: object
+                properties:
+                  apiVersion:
+                    type: string
+                  kind:
+                    type: string
+                  name:
+                    type: string
+              minReplicas:
+                type: integer
+                minimum: 1
+              maxReplicas:
+                type: integer
+                minimum: 1
+              gameMetrics:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                    target:
+                      type: object
+                      properties:
+                        type:
+                          type: string
+                        averageValue:
+                          type: string
+          status:
+            type: object
+            properties:
+              currentReplicas:
+                type: integer
+              desiredReplicas:
+                type: integer
+              conditions:
+                type: array
+                items:
+                  type: object
+  scope: Namespaced
+  names:
+    plural: gameautoscalers
+    singular: gameautoscaler
+    kind: GameAutoScaler
+
+---
+# Game Auto Scaler Instance
+apiVersion: autoscaling.hokm.io/v1
+kind: GameAutoScaler
+metadata:
+  name: hokm-game-autoscaler
+  namespace: hokm-game
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: hokm-server
+  minReplicas: 2
+  maxReplicas: 20
+  gameMetrics:
+  - name: active_games_per_pod
+    target:
+      type: AverageValue
+      averageValue: "10"
+  - name: players_per_pod
+    target:
+      type: AverageValue
+      averageValue: "80"
+  - name: game_creation_rate
+    target:
+      type: Value
+      value: "5"

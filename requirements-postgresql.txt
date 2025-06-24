@@ -1,0 +1,38 @@
+"""
+Requirements for PostgreSQL integration with Hokm Game Server
+"""
+
+# Core database dependencies
+asyncpg==0.29.0
+aioredis==2.0.1
+
+# Connection pooling and utilities
+psycopg2-binary==2.9.9
+sqlalchemy[asyncio]==2.0.23
+
+# JSON and data handling
+ujson==5.8.0
+orjson==3.9.10
+
+# Async utilities
+asyncio-mqtt==0.16.1
+aiofiles==23.2.1
+
+# Monitoring and logging
+prometheus-client==0.19.0
+structlog==23.2.0
+
+# Security
+cryptography==41.0.8
+bcrypt==4.1.2
+pyjwt==2.8.0
+
+# Testing and development
+pytest-asyncio==0.21.1
+pytest-postgresql==5.0.0
+fakeredis==2.20.1
+
+# Existing requirements (ensure compatibility)
+websockets>=11.0
+redis>=4.5.0
+pytest>=7.0.0

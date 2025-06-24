@@ -5,6 +5,7 @@ import json
 import sys
 import random
 import os
+import time
 
 # Add current directory to Python path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -13,7 +14,31 @@ from game_states import GameState
 
 
 SERVER_URI = "ws://localhost:8765"
-SESSION_FILE = os.environ.get('PLAYER_SESSION', '.player_session')  # Allow configurable session file
+
+def get_terminal_session_id():
+    """Generate a persistent session ID for the current terminal"""
+    import hashlib
+    import socket
+    import getpass
+    
+    # Try to get terminal-specific identifiers
+    terminal_id = os.environ.get('TERM_SESSION_ID', '')  # macOS Terminal
+    if not terminal_id:
+        terminal_id = os.environ.get('WINDOWID', '')  # X11 terminals
+    if not terminal_id:
+        terminal_id = os.environ.get('SSH_TTY', '')  # SSH sessions
+    if not terminal_id:
+        try:
+            terminal_id = os.ttyname(0)  # Terminal device name
+        except (OSError, AttributeError):
+            terminal_id = f"{socket.gethostname()}_{getpass.getuser()}"
+    
+    # Create a hash for the session file name (first 8 characters)
+    session_hash = hashlib.md5(terminal_id.encode()).hexdigest()[:8]
+    return f".player_session_{session_hash}"
+
+# Create persistent session file per terminal window
+SESSION_FILE = os.environ.get('PLAYER_SESSION', get_terminal_session_id())
 
 def display_hand_by_suit(hand, hokm=None):
     suits = ['hearts', 'diamonds', 'clubs', 'spades']
@@ -101,6 +126,22 @@ async def check_for_exit(ws, room_code):
                 return True
         await asyncio.sleep(0.1)  # Small delay to prevent hogging CPU
 
+def clear_session():
+    """Clear the current session file"""
+    try:
+        if os.path.exists(SESSION_FILE):
+            os.remove(SESSION_FILE)
+            print("🗑️ Session cleared")
+        else:
+            print("📝 No session file to clear")
+    except Exception as e:
+        print(f"❌ Error clearing session: {e}")
+
+def preserve_session():
+    """Keep the session file for future reconnections"""
+    print("💾 Session preserved for future reconnections")
+    print(f"📁 Session file: {SESSION_FILE}")
+
 async def main():
     you = None
     hakem = None
@@ -142,6 +183,7 @@ async def main():
     room_code = "9999"  # Default room code
     
     print(f"\nConnecting to server...")
+    print(f"📁 Session file: {SESSION_FILE}")
     
     summary_info = {}
     hand_info = {}
@@ -149,21 +191,43 @@ async def main():
     # Track player ID for gameplay
     player_id = None
     
-    # Check for and remove any old session file
+    # Check for existing session data for reconnection
+    session_player_id = None
     if os.path.exists(SESSION_FILE):
         try:
-            os.remove(SESSION_FILE)
-            print("Removed old session data")
-        except:
-            print("Failed to remove old session file")
+            with open(SESSION_FILE, 'r') as f:
+                session_player_id = f.read().strip()
+            if session_player_id:
+                print(f"🔍 Found existing session file with player ID: {session_player_id}")
+                print(f"🔄 Attempting to reconnect to previous game...")
+                print(f"   (If this fails, the game may have ended or server restarted)")
+            else:
+                os.remove(SESSION_FILE)  # Remove empty session file
+                print("📝 Starting fresh session (empty session file removed)")
+        except Exception as e:
+            print(f"⚠️  Failed to read session file: {e}")
+            try:
+                os.remove(SESSION_FILE)  # Remove corrupted session file
+                print("📝 Starting fresh session (corrupted session file removed)")
+            except:
+                pass
+    else:
+        print("📝 No previous session found, starting fresh")
     
     async with websockets.connect(SERVER_URI) as ws:
-        # Always start a new session - no reconnection attempts
-        await ws.send(json.dumps({
-            "type": "join",
-            "username": player_base,
-            "room_code": "9999"
-        }))
+        # Try to reconnect if we have a session, otherwise join as new player
+        if session_player_id:
+            await ws.send(json.dumps({
+                "type": "reconnect",
+                "player_id": session_player_id,
+                "room_code": "9999"
+            }))
+        else:
+            await ws.send(json.dumps({
+                "type": "join",
+                "username": player_base,
+                "room_code": "9999"
+            }))
         
         while True:
             try:
@@ -197,18 +261,125 @@ async def main():
                 if msg_type == 'error':
                     error_msg = data.get('message', 'Unknown error')
                     print(f"\n❌ Error: {error_msg}")
+                    
+                    # If reconnection failed, try joining as new player
+                    if session_player_id and ("reconnect" in error_msg.lower() or "session" in error_msg.lower()):
+                        print("🔄 Reconnection failed, trying to join as new player...")
+                        # Remove the invalid session file
+                        try:
+                            os.remove(SESSION_FILE)
+                        except:
+                            pass
+                        session_player_id = None  # Clear session
+                        
+                        # Try joining as new player
+                        await ws.send(json.dumps({
+                            "type": "join",
+                            "username": player_base,
+                            "room_code": "9999"
+                        }))
+                        continue
                     print(f"[DEBUG] Error handler state - your_turn: {your_turn}, last_turn_hand: {last_turn_hand is not None}, hand: {hand is not None}")
                     
                     # Handle connection/player not found errors
                     if ("Player not found in room" in error_msg or 
                         "Connection lost" in error_msg or
-                        "try reconnecting" in error_msg):
+                        "try reconnecting" in error_msg or
+                        "Game room no longer exists" in error_msg or
+                        "player slot is no longer available" in error_msg or
+                        "No active game found" in error_msg):
+                        
+                        # Check for specific cases where reconnection is futile
+                        if ("Game room no longer exists" in error_msg or
+                            "No active game found" in error_msg or
+                            "game may have ended" in error_msg.lower()):
+                            print("\n🚫 GAME NO LONGER AVAILABLE")
+                            print("The game has ended, been cancelled, or the server was restarted.")
+                            print("Your session will be cleared automatically.")
+                            clear_session()
+                            print("Please restart the client to join a new game.")
+                            await ws.close()
+                            return
+                            
                         print("\n🔄 CONNECTION ISSUE DETECTED")
                         print("This usually happens when the server loses track of your player ID.")
                         print("\nOptions:")
-                        print("1. Type 'exit' to leave and rejoin the game")
-                        print("2. Wait a moment - the server may recover automatically")
-                        print("3. If this keeps happening, restart the server")
+                        print("1. Type 'exit' to leave and preserve session")
+                        print("2. Type 'clear_session' to remove session and start fresh")
+                        print("3. Type 'retry' to try reconnecting again")
+                        print("4. Press Enter to continue with current connection")
+                        
+                        input_received = False
+                        while not input_received:
+                            try:
+                                choice = input("\nWhat would you like to do? (exit/clear_session/retry/enter): ").strip().lower()
+                                print(f"[DEBUG] Connection error handler - User input: '{choice}'")
+                                
+                                if choice == 'exit':
+                                    print("Exiting client...")
+                                    preserve_session()  # Keep session for reconnection
+                                    try:
+                                        await ws.send(json.dumps({
+                                            'type': 'clear_room',
+                                            'room_code': room_code
+                                        }))
+                                        print("Room cleared. Exiting client.")
+                                    except:
+                                        pass  # Connection might be broken
+                                    await ws.close()
+                                    return
+                                    
+                                elif choice == 'clear_session':
+                                    print("Clearing session and starting fresh...")
+                                    clear_session()
+                                    print("Session cleared. Please restart the client to join a new game.")
+                                    await ws.close()
+                                    return
+                                    
+                                elif choice == 'retry':
+                                    print("Attempting to reconnect...")
+                                    # Read the actual player ID from session file
+                                    try:
+                                        if os.path.exists(SESSION_FILE):
+                                            with open(SESSION_FILE, 'r') as f:
+                                                session_content = f.read().strip()
+                                            if session_content:
+                                                print(f"[DEBUG] Using player_id: {session_content[:8]}...")
+                                                await ws.send(json.dumps({
+                                                    "type": "reconnect",
+                                                    "player_id": session_content,
+                                                    "room_code": room_code
+                                                }))
+                                                print("Reconnection request sent. Waiting for server response...")
+                                                input_received = True
+                                                break  # Exit the input loop and wait for server response
+                                            else:
+                                                print("❌ Session file is empty.")
+                                                print("   Consider clearing the session and starting fresh.")
+                                        else:
+                                            print("❌ No session file found.")
+                                            print("   You'll need to start a new game session.")
+                                    except Exception as e:
+                                        print(f"❌ Error reading session file: {e}")
+                                        print("   The session file may be corrupted.")
+                                    
+                                    if not input_received:
+                                        print("Reconnection attempt failed. Please try a different option.")
+                                    continue
+                                    
+                                elif choice == '' or choice == 'enter':
+                                    print("Continuing with current connection...")
+                                    input_received = True
+                                    break  # Continue with the main message loop
+                                    
+                                else:
+                                    print("Invalid choice. Please type 'exit', 'clear_session', 'retry', or press Enter.")
+                                    continue
+                                    
+                            except (EOFError, KeyboardInterrupt):
+                                print("\nExiting client...")
+                                await ws.close()
+                                return
                         continue
                     
                     # Handle suit-following errors by re-prompting for card selection
@@ -221,14 +392,25 @@ async def main():
                             for idx, card in enumerate(sorted_hand, 1):
                                 print(f"{idx}. {card}")
                             
-                            print("(Type 'exit' to clear room and exit)")
+                            print("(Type 'exit' to exit and preserve session, or 'clear_session' to reset)")
                             while True:
                                 try:
-                                    choice = input(f"Select a card to play (1-{len(sorted_hand)}) or 'exit': ")
+                                    choice = input(f"Select a card to play (1-{len(sorted_hand)}), 'exit', or 'clear_session': ")
                                     print(f"[DEBUG] Error re-prompt - User input: '{choice}', Hand size: {len(sorted_hand)}")
                                     
                                     if choice.lower() == 'exit':
-                                        print("Sending command to clear room and exiting...")
+                                        print("Exiting client...")
+                                        preserve_session()  # Keep session for reconnection
+                                        await ws.send(json.dumps({
+                                            'type': 'clear_room',
+                                            'room_code': room_code
+                                        }))
+                                        print("Room cleared. Exiting client.")
+                                        await ws.close()
+                                        return
+                                    elif choice.lower() == 'clear_session':
+                                        print("Clearing session and exiting...")
+                                        clear_session()  # Remove session file
                                         await ws.send(json.dumps({
                                             'type': 'clear_room',
                                             'room_code': room_code
@@ -273,13 +455,59 @@ async def main():
                 elif msg_type == 'join_success':
                     player_id = data.get('player_id')
                     username = data.get('username', username)
+                    reconnected = data.get('reconnected', False)
                     
                     if player_id:
                         # Save player_id to session file for reconnection
                         try:
                             with open(SESSION_FILE, 'w') as f:
                                 f.write(player_id)
-                            print(f"✅ Successfully joined as {username}")
+                            
+                            if reconnected:
+                                print(f"🔄 {data.get('message', 'Reconnected successfully')}")
+                                print(f"Resuming as {username}")
+                            else:
+                                print(f"✅ Successfully joined as {username}")
+                        except Exception as e:
+                            print(f"⚠️ Warning: Could not save session: {e}")
+                    else:
+                        print("⚠️ Warning: No player_id received from server")
+                    continue
+
+                # Handle reconnection success 
+                elif msg_type == 'reconnect_success':
+                    player_id = data.get('player_id')
+                    username = data.get('username', username)
+                    game_state_data = data.get('game_state', {})
+                    
+                    if player_id:
+                        # Update session file
+                        try:
+                            with open(SESSION_FILE, 'w') as f:
+                                f.write(player_id)
+                            print(f"🔄 Successfully reconnected as {username}")
+                            
+                            # Restore game state if available
+                            if game_state_data:
+                                phase = game_state_data.get('phase', 'unknown')
+                                print(f"📋 Game state: {phase}")
+                                
+                                # Set variables from restored state
+                                you = game_state_data.get('you')
+                                your_team = game_state_data.get('your_team')
+                                hand_info = {'cards': game_state_data.get('hand', [])}
+                                
+                                # Display current hand if available
+                                if hand_info['cards']:
+                                    print(f"\n=== Your Current Hand ===")
+                                    for i, card in enumerate(hand_info['cards'], 1):
+                                        rank, suit = card.split('_')
+                                        print(f"{i:2d}. {rank} of {suit}")
+                                
+                                hokm = game_state_data.get('hokm')
+                                if hokm:
+                                    print(f"\nHokm is: {hokm.upper()}")
+                                
                         except Exception as e:
                             print(f"⚠️ Warning: Could not save session: {e}")
                     else:
@@ -424,14 +652,26 @@ async def main():
                                 print(f"{idx}. {card}")
                             
                             if your_turn:
-                                # Prompt for card play                                        print("(Type 'exit' to clear room and exit)")
+                                # Prompt for card play
+                                print("(Type 'exit' to exit and preserve session, or 'clear_session' to reset)")
                                 while True:
                                     try:
-                                        choice = input(f"Select a card to play (1-{len(sorted_hand)}) or 'exit': ")
+                                        choice = input(f"Select a card to play (1-{len(sorted_hand)}), 'exit', or 'clear_session': ")
                                         print(f"[DEBUG] User input: '{choice}', Hand size: {len(sorted_hand)}")
                                         
                                         if choice.lower() == 'exit':
-                                            print("Sending command to clear room and exiting...")
+                                            print("Exiting client...")
+                                            preserve_session()  # Keep session for reconnection
+                                            await ws.send(json.dumps({
+                                                'type': 'clear_room',
+                                                'room_code': room_code
+                                            }))
+                                            print("Room cleared. Exiting client.")
+                                            await ws.close()
+                                            break
+                                        elif choice.lower() == 'clear_session':
+                                            print("Clearing session and exiting...")
+                                            clear_session()  # Remove session file
                                             await ws.send(json.dumps({
                                                 'type': 'clear_room',
                                                 'room_code': room_code
