@@ -61,33 +61,8 @@ class AsyncSessionManager:
             'average_query_time': 0.0
         }
         
-        # Circuit breaker integration
-        from .postgresql_circuit_breaker import PostgreSQLCircuitBreaker, CircuitBreakerConfig
-        
-        # Configure circuit breaker for database operations
-        circuit_config = CircuitBreakerConfig(
-            failure_threshold=5,
-            recovery_timeout=60,
-            success_threshold=3,
-            call_timeout=30.0,
-            max_retries=3,
-            initial_retry_delay=1.0,
-            max_retry_delay=30.0,
-            backoff_multiplier=2.0,
-            enable_fallback=True,
-            fallback_cache_ttl=300
-        )
-        
-        self.circuit_breaker = PostgreSQLCircuitBreaker(
-            name="session_manager_circuit_breaker",
-            config=circuit_config
-        )
-        
-        # Circuit breaker monitor (will be set up during initialization)
-        self.circuit_monitor = None
-        
         # Circuit breaker for database failures
-        self.circuit_breaker_state = {
+        self.circuit_breaker = {
             'failure_count': 0,
             'last_failure_time': 0,
             'is_open': False,
@@ -123,22 +98,14 @@ class AsyncSessionManager:
                 expire_on_commit=self.config.expire_on_commit,
             )
             
-            # Initialize circuit breaker monitor
-            from .circuit_breaker_monitor import PostgreSQLCircuitBreakerMonitor
-            self.circuit_monitor = PostgreSQLCircuitBreakerMonitor()
-            self.circuit_monitor.register_circuit_breaker("session_manager", self.circuit_breaker)
-            
-            # Start monitoring
-            await self.circuit_monitor.start_monitoring()
-            
             # Set up event listeners for monitoring
             self._setup_event_listeners()
             
-            # Test the connection with circuit breaker
-            await self._test_connection_with_circuit_breaker()
+            # Test the connection
+            await self._test_connection()
             
             self.is_initialized = True
-            logger.info("Database session manager initialized successfully with circuit breaker protection")
+            logger.info("Database session manager initialized successfully")
             
         except Exception as e:
             logger.error(f"Failed to initialize database session manager: {e}")
@@ -156,11 +123,6 @@ class AsyncSessionManager:
         logger.info("Cleaning up database session manager")
         
         try:
-            # Stop circuit breaker monitoring
-            if self.circuit_monitor:
-                await self.circuit_monitor.stop_monitoring()
-                self.circuit_monitor = None
-            
             # Close all active sessions
             for session in list(self.active_sessions):
                 try:
@@ -269,8 +231,8 @@ class AsyncSessionManager:
                     logger.info("Database schema validation passed")
             
             # Reset circuit breaker on successful connection
-            self.circuit_breaker_state['failure_count'] = 0
-            self.circuit_breaker_state['is_open'] = False
+            self.circuit_breaker['failure_count'] = 0
+            self.circuit_breaker['is_open'] = False
             
         except Exception as e:
             self._handle_connection_failure(e)
@@ -282,28 +244,28 @@ class AsyncSessionManager:
         Prevents cascading failures in high-traffic gaming scenarios
         """
         self.connection_stats['failed_connections'] += 1
-        self.circuit_breaker_state['failure_count'] += 1
-        self.circuit_breaker_state['last_failure_time'] = time.time()
+        self.circuit_breaker['failure_count'] += 1
+        self.circuit_breaker['last_failure_time'] = time.time()
         
         logger.error(f"Database connection failure: {error}")
         
         # Open circuit breaker if threshold exceeded
-        if self.circuit_breaker_state['failure_count'] >= self.circuit_breaker_state['failure_threshold']:
-            self.circuit_breaker_state['is_open'] = True
+        if self.circuit_breaker['failure_count'] >= self.circuit_breaker['failure_threshold']:
+            self.circuit_breaker['is_open'] = True
             logger.error("Database circuit breaker opened due to repeated failures")
     
     def _should_allow_connection(self) -> bool:
         """
         Check if connections should be allowed based on circuit breaker state
         """
-        if not self.circuit_breaker_state['is_open']:
+        if not self.circuit_breaker['is_open']:
             return True
         
         # Check if recovery timeout has passed
-        if time.time() - self.circuit_breaker_state['last_failure_time'] > self.circuit_breaker_state['recovery_timeout']:
+        if time.time() - self.circuit_breaker['last_failure_time'] > self.circuit_breaker['recovery_timeout']:
             logger.info("Attempting to recover from database failures")
-            self.circuit_breaker_state['is_open'] = False
-            self.circuit_breaker_state['failure_count'] = 0
+            self.circuit_breaker['is_open'] = False
+            self.circuit_breaker['failure_count'] = 0
             return True
         
         return False
@@ -515,155 +477,6 @@ class AsyncSessionManager:
             'max_overflow': self.config.max_overflow,
         })
         return stats
-    
-    async def _test_connection_with_circuit_breaker(self) -> None:
-        """
-        Test database connection using circuit breaker protection
-        """
-        async def test_connection():
-            async with self.session_factory() as session:
-                result = await session.execute(text("SELECT 1"))
-                return result.scalar()
-        
-        try:
-            result = await self.circuit_breaker.call(
-                test_connection,
-                operation_name="connection_test"
-            )
-            logger.info(f"Database connection test successful: {result}")
-        except Exception as e:
-            logger.error(f"Database connection test failed: {e}")
-            raise
-    
-    async def get_session_with_circuit_breaker(self) -> AsyncSession:
-        """
-        Get a database session with circuit breaker protection
-        """
-        async def create_session():
-            if not self.session_factory:
-                raise RuntimeError("Session manager not initialized")
-            
-            session = self.session_factory()
-            self.active_sessions.add(session)
-            self.connection_stats['active_sessions_count'] = len(self.active_sessions)
-            return session
-        
-        return await self.circuit_breaker.call(
-            create_session,
-            operation_name="session_create"
-        )
-    
-    @asynccontextmanager
-    async def get_transaction_with_circuit_breaker(self):
-        """
-        Get a database transaction with circuit breaker protection
-        Automatically commits on success, rolls back on error
-        """
-        session = await self.get_session_with_circuit_breaker()
-        
-        try:
-            async with session.begin():
-                yield session
-        except Exception as e:
-            logger.error(f"Transaction failed, rolling back: {e}")
-            try:
-                await session.rollback()
-            except Exception as rollback_error:
-                logger.error(f"Rollback failed: {rollback_error}")
-            raise
-        finally:
-            try:
-                await session.close()
-                if session in self.active_sessions:
-                    self.active_sessions.discard(session)
-                self.connection_stats['active_sessions_count'] = len(self.active_sessions)
-            except Exception as close_error:
-                logger.warning(f"Error closing session: {close_error}")
-    
-    async def execute_with_circuit_breaker(self, query, parameters=None, operation_name="database_query"):
-        """
-        Execute a query with circuit breaker protection
-        """
-        async def execute_query():
-            async with self.get_session_with_circuit_breaker() as session:
-                if parameters:
-                    result = await session.execute(query, parameters)
-                else:
-                    result = await session.execute(query)
-                await session.commit()
-                return result
-        
-        return await self.circuit_breaker.call(
-            execute_query,
-            operation_name=operation_name
-        )
-    
-    async def health_check_with_circuit_breaker(self) -> Dict[str, Any]:
-        """
-        Enhanced health check with circuit breaker metrics
-        """
-        health_data = {
-            'status': 'unknown',
-            'response_time': 0.0,
-            'circuit_breaker': {},
-            'connection_stats': self.connection_stats.copy(),
-            'timestamp': time.time()
-        }
-        
-        start_time = time.time()
-        
-        try:
-            # Test basic connection
-            await self._test_connection_with_circuit_breaker()
-            
-            response_time = time.time() - start_time
-            health_data.update({
-                'status': 'healthy',
-                'response_time': response_time
-            })
-            
-        except Exception as e:
-            response_time = time.time() - start_time
-            health_data.update({
-                'status': 'unhealthy',
-                'response_time': response_time,
-                'error': str(e)
-            })
-        
-        # Add circuit breaker information
-        if self.circuit_breaker:
-            health_data['circuit_breaker'] = {
-                'state': self.circuit_breaker.get_state(),
-                'metrics': self.circuit_breaker.get_metrics()
-            }
-        
-        return health_data
-    
-    async def get_comprehensive_health_status(self) -> Dict[str, Any]:
-        """
-        Get comprehensive health status including all monitoring data
-        """
-        health_status = await self.health_check_with_circuit_breaker()
-        
-        # Add monitoring data if available
-        if self.circuit_monitor:
-            try:
-                monitoring_data = await self.circuit_monitor.get_comprehensive_metrics()
-                health_status['monitoring'] = monitoring_data
-            except Exception as e:
-                logger.warning(f"Failed to get monitoring data: {e}")
-                health_status['monitoring'] = {'error': str(e)}
-        
-        # Add pool statistics
-        if self.engine and hasattr(self.engine.pool, 'size'):
-            try:
-                pool_status = await self.get_pool_stats()
-                health_status['connection_pool'] = pool_status
-            except Exception as e:
-                logger.warning(f"Failed to get pool stats: {e}")
-                health_status['connection_pool'] = {'error': str(e)}
-        
-        return health_status
 
 
 # Global session manager instance

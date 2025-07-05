@@ -8,6 +8,8 @@ import uuid
 import random
 import time
 import os
+import concurrent.futures
+import traceback
 
 # Add current directory to Python path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -54,12 +56,19 @@ class GameServer:
             if not room_exists:
                 print(f"[DEBUG] Room {room_code} doesn't exist, creating it")
                 try:
-                    self.redis_manager.create_room(room_code)
+                    # Add timeout to Redis operations
+                    executor = concurrent.futures.ThreadPoolExecutor()
+                    loop = asyncio.get_event_loop()
+                    await asyncio.wait_for(
+                        loop.run_in_executor(executor, self.redis_manager.create_room, room_code),
+                        timeout=2.0
+                    )
                     print(f"[LOG] Room {room_code} created successfully")
+                except asyncio.TimeoutError:
+                    print(f"[DEBUG] Redis timeout when creating room, continuing anyway")
                 except Exception as e:
                     print(f"[ERROR] Failed to create room {room_code}: {str(e)}")
-                    await self.network_manager.notify_error(websocket, "Failed to create game room")
-                    return None
+                    # Continue anyway - room creation is not critical for basic functionality
             else:
                 print(f"[DEBUG] Room {room_code} already exists")
 
@@ -105,21 +114,38 @@ class GameServer:
                         )
                         if room_code in self.active_games:
                             del self.active_games[room_code]
-                        self.redis_manager.delete_game_state(room_code)
+                        
+                        # Delete game state with timeout to avoid hanging
+                        try:
+                            executor = concurrent.futures.ThreadPoolExecutor()
+                            loop = asyncio.get_event_loop()
+                            await asyncio.wait_for(
+                                loop.run_in_executor(executor, self.redis_manager.delete_game_state, room_code),
+                                timeout=2.0
+                            )
+                            print(f"[DEBUG] Deleted game state for room {room_code}")
+                        except asyncio.TimeoutError:
+                            print(f"[DEBUG] Redis timeout when deleting game state, continuing anyway")
+                        except Exception as e:
+                            print(f"[DEBUG] Could not delete game state: {e}, continuing anyway")
+                        
                         return None
                     else:
                         print(f"[LOG] Room {room_code} has disconnected players who might reconnect. Not cancelling game yet.")
 
             # Check if room is full (count only active players for new joins)
             print(f"[DEBUG] Getting room players...")
-            try:
-                # Use in-memory tracking instead of Redis to avoid hanging
-                room_players = []  # Start with empty room for simplicity
-                print(f"[DEBUG] Using simplified room tracking")
-            except Exception as e:
-                print(f"[DEBUG] Room players check failed: {e}, using empty list")
-                room_players = []
-            print(f"[DEBUG] Room players: {len(room_players)}")
+            
+            # SIMPLIFIED: Use only network manager connections for now to avoid Redis hangs
+            room_players = []
+            for ws, metadata in self.network_manager.connection_metadata.items():
+                if metadata.get('room_code') == room_code:
+                    room_players.append({
+                        'player_id': metadata.get('player_id'),
+                        'username': f"Player {len(room_players) + 1}",
+                        'connection_status': 'active'
+                    })
+            print(f"[DEBUG] Room players from network manager: {len(room_players)}")
             active_players = [p for p in room_players if p.get('connection_status') == 'active']
             print(f"[DEBUG] Active players: {len(active_players)}")
             
@@ -137,7 +163,12 @@ class GameServer:
 
             # Create new player with unique ID and name
             player_id = str(uuid.uuid4())
-            player_number = len(room_players) + 1
+            # Count current players in this room to assign correct player number
+            current_room_count = 0
+            for ws, metadata in self.network_manager.connection_metadata.items():
+                if metadata.get('room_code') == room_code:
+                    current_room_count += 1
+            player_number = current_room_count + 1  # This player will be the next number
             username = f"Player {player_number}"
 
             # Save session data to Redis
@@ -149,10 +180,28 @@ class GameServer:
                 'player_number': player_number,
                 'connection_status': 'active'
             }
-            self.redis_manager.save_player_session(player_id, session_data)
+            try:
+                executor = concurrent.futures.ThreadPoolExecutor()
+                loop = asyncio.get_event_loop()
+                await asyncio.wait_for(
+                    loop.run_in_executor(executor, self.redis_manager.save_player_session, player_id, session_data),
+                    timeout=2.0
+                )
+                print(f"[DEBUG] Saved session data for {username}")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Redis timeout when saving session, continuing anyway")
+            except Exception as e:
+                print(f"[DEBUG] Could not save session data: {e}, continuing anyway")
 
             # Register live connection
             self.network_manager.register_connection(websocket, player_id, room_code)
+            
+            # Debug: check connection count immediately after registration
+            debug_count = 0
+            for ws, metadata in self.network_manager.connection_metadata.items():
+                if metadata.get('room_code') == room_code:
+                    debug_count += 1
+            print(f"[DEBUG] Connections for room {room_code} after registration: {debug_count}")
 
             # Add to room
             room_data = {
@@ -162,10 +211,30 @@ class GameServer:
                 'joined_at': str(int(time.time())),
                 'connection_status': 'active'
             }
-            self.redis_manager.add_player_to_room(room_code, room_data)
+            try:
+                executor = concurrent.futures.ThreadPoolExecutor()
+                loop = asyncio.get_event_loop()
+                await asyncio.wait_for(
+                    loop.run_in_executor(executor, self.redis_manager.add_player_to_room, room_code, room_data),
+                    timeout=2.0
+                )
+                print(f"[DEBUG] Added {username} to room {room_code}")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Redis timeout when adding to room, continuing anyway")
+            except Exception as e:
+                print(f"[DEBUG] Could not add to room: {e}, continuing anyway")
+
+            # Get updated player count after adding this player
+            # Use simple counting based on network manager connections
+            current_player_count = 0
+            for ws, metadata in self.network_manager.connection_metadata.items():
+                if metadata.get('room_code') == room_code:
+                    current_player_count += 1
+            
+            print(f"[DEBUG] Updated player count: {current_player_count}")
 
             # Send join confirmation
-            print(f"[LOG] Room {room_code}: {username} joined [PHASE: {GameState.WAITING_FOR_PLAYERS.value}] - Players: {len(room_players) + 1}/4")
+            print(f"[LOG] Room {room_code}: {username} joined [PHASE: {GameState.WAITING_FOR_PLAYERS.value}] - Players: {current_player_count}/4")
             await self.network_manager.send_message(
                 websocket,
                 'join_success',
@@ -178,8 +247,10 @@ class GameServer:
             )
 
             # Start game if room is full
-            if len(room_players) + 1 >= ROOM_SIZE:
+            if current_player_count >= ROOM_SIZE:
                 print(f"[LOG] Room {room_code} is full, ready to play! [PHASE: {GameState.TEAM_ASSIGNMENT.value}]")
+                # Add a small delay to ensure all connections are registered
+                await asyncio.sleep(0.5)
                 await self.handle_game_start(room_code)
 
             return True
@@ -202,8 +273,35 @@ class GameServer:
                     print(f"[LOG] Game already in progress in room {room_code} (phase: {existing_game.game_phase}), skipping initialization")
                     return
             
-            # Get all players in room
-            players = [p['username'] for p in self.redis_manager.get_room_players(room_code)]
+            # Get all players in room with timeout and fallback
+            print(f"[DEBUG] Getting players for room {room_code} to start game")
+            executor = concurrent.futures.ThreadPoolExecutor()
+            loop = asyncio.get_event_loop()
+            
+            try:
+                room_players_data = await asyncio.wait_for(
+                    loop.run_in_executor(executor, self.redis_manager.get_room_players, room_code),
+                    timeout=2.0
+                )
+                players = [p['username'] for p in room_players_data]
+                print(f"[DEBUG] Got players from Redis: {players}")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Redis timeout when getting room players, using network manager fallback")
+                # Fallback: get players from network manager connections
+                connected_players_count = 0
+                for ws, metadata in self.network_manager.connection_metadata.items():
+                    if metadata.get('room_code') == room_code:
+                        connected_players_count += 1
+                
+                if connected_players_count >= ROOM_SIZE:
+                    players = [f"Player{i+1}" for i in range(ROOM_SIZE)]  # Fallback player names
+                    print(f"[DEBUG] Using fallback players: {players}")
+                else:
+                    print(f"[ERROR] Not enough connected players for fallback: {connected_players_count}")
+                    return
+            except Exception as e:
+                print(f"[ERROR] Could not get room players: {e}")
+                return
             
             # Create new game instance
             game = GameBoard(players, room_code)
@@ -212,47 +310,158 @@ class GameServer:
             # Assign teams and get initial state
             team_result = game.assign_teams_and_hakem(self.redis_manager)
             
-            # Save initial game state
-            game_state = game.to_redis_dict()
-            self.redis_manager.save_game_state(room_code, game_state)
+            # Save initial game state with timeout
+            try:
+                game_state = game.to_redis_dict()
+                await asyncio.wait_for(
+                    loop.run_in_executor(executor, self.redis_manager.save_game_state, room_code, game_state),
+                    timeout=2.0
+                )
+                print(f"[DEBUG] Saved initial game state to Redis")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Redis timeout when saving initial game state, continuing anyway")
+            except Exception as e:
+                print(f"[DEBUG] Could not save initial game state: {e}, continuing anyway")
             
-            # Broadcast phase change to TEAM_ASSIGNMENT
-            await self.network_manager.broadcast_to_room(
-                room_code,
-                'phase_change',
-                {'new_phase': GameState.TEAM_ASSIGNMENT.value},
-                self.redis_manager
-            )
+            # Broadcast phase change to TEAM_ASSIGNMENT with timeout protection
+            print(f"[DEBUG] Broadcasting TEAM_ASSIGNMENT phase change...")
+            try:
+                await asyncio.wait_for(
+                    self.network_manager.broadcast_to_room(
+                        room_code,
+                        'phase_change',
+                        {'new_phase': GameState.TEAM_ASSIGNMENT.value},
+                        self.redis_manager
+                    ),
+                    timeout=3.0
+                )
+                print(f"[DEBUG] TEAM_ASSIGNMENT phase change broadcasted")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Timeout broadcasting TEAM_ASSIGNMENT phase change, trying direct network broadcast")
+                # Fallback: broadcast directly to network connections
+                for ws, metadata in self.network_manager.connection_metadata.items():
+                    if metadata.get('room_code') == room_code:
+                        try:
+                            await self.network_manager.send_message(
+                                ws,
+                                'phase_change',
+                                {'new_phase': GameState.TEAM_ASSIGNMENT.value}
+                            )
+                        except Exception as e:
+                            print(f"[DEBUG] Failed to send phase change to individual connection: {e}")
+            except Exception as e:
+                print(f"[DEBUG] Error broadcasting TEAM_ASSIGNMENT phase change: {e}")
             
-            # Broadcast team assignments
-            await self.network_manager.broadcast_to_room(
-                room_code,
-                'team_assignment',
-                team_result,
-                self.redis_manager
-            )
+            # Broadcast team assignments with timeout protection
+            print(f"[DEBUG] Broadcasting team assignments...")
+            try:
+                await asyncio.wait_for(
+                    self.network_manager.broadcast_to_room(
+                        room_code,
+                        'team_assignment',
+                        team_result,
+                        self.redis_manager
+                    ),
+                    timeout=3.0
+                )
+                print(f"[DEBUG] Team assignments broadcasted")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Timeout broadcasting team assignments, trying direct network broadcast")
+                # Fallback: broadcast directly to network connections
+                for ws, metadata in self.network_manager.connection_metadata.items():
+                    if metadata.get('room_code') == room_code:
+                        try:
+                            await self.network_manager.send_message(
+                                ws,
+                                'team_assignment',
+                                team_result
+                            )
+                        except Exception as e:
+                            print(f"[DEBUG] Failed to send team assignment to individual connection: {e}")
+            except Exception as e:
+                print(f"[DEBUG] Error broadcasting team assignments: {e}")
             
             # Deal initial cards
+            print(f"[DEBUG] Dealing initial cards...")
             initial_hands = game.initial_deal()
+            print(f"[DEBUG] Initial cards dealt, hands: {len(initial_hands)}")
             
             # Transition to waiting for hokm phase
             game.game_phase = GameState.WAITING_FOR_HOKM.value
-            game_state = game.to_redis_dict()
-            self.redis_manager.save_game_state(room_code, game_state)
+            print(f"[DEBUG] Game phase set to WAITING_FOR_HOKM")
+            
+            # Save game state with timeout
+            try:
+                game_state = game.to_redis_dict()
+                await asyncio.wait_for(
+                    loop.run_in_executor(executor, self.redis_manager.save_game_state, room_code, game_state),
+                    timeout=2.0
+                )
+                print(f"[DEBUG] Saved WAITING_FOR_HOKM game state to Redis")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Redis timeout when saving WAITING_FOR_HOKM state, continuing anyway")
+            except Exception as e:
+                print(f"[DEBUG] Could not save WAITING_FOR_HOKM state: {e}, continuing anyway")
             
             # Broadcast phase change to WAITING_FOR_HOKM - CRITICAL for hokm selection
             print(f"[LOG] Broadcasting phase change to WAITING_FOR_HOKM in room {room_code}")
-            await self.network_manager.broadcast_to_room(
-                room_code,
-                'phase_change',
-                {'new_phase': GameState.WAITING_FOR_HOKM.value},
-                self.redis_manager
-            )
+            try:
+                await asyncio.wait_for(
+                    self.network_manager.broadcast_to_room(
+                        room_code,
+                        'phase_change',
+                        {'new_phase': GameState.WAITING_FOR_HOKM.value},
+                        self.redis_manager
+                    ),
+                    timeout=3.0
+                )
+                print(f"[DEBUG] WAITING_FOR_HOKM phase change broadcasted")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Timeout broadcasting WAITING_FOR_HOKM phase change, trying direct network broadcast")
+                # Fallback: broadcast directly to network connections
+                for ws, metadata in self.network_manager.connection_metadata.items():
+                    if metadata.get('room_code') == room_code:
+                        try:
+                            await self.network_manager.send_message(
+                                ws,
+                                'phase_change',
+                                {'new_phase': GameState.WAITING_FOR_HOKM.value}
+                            )
+                        except Exception as e:
+                            print(f"[DEBUG] Failed to send phase change to individual connection: {e}")
+            except Exception as e:
+                print(f"[DEBUG] Error broadcasting WAITING_FOR_HOKM phase change: {e}")
             
             # Send initial hands to players
-            for player in self.redis_manager.get_room_players(room_code):
+            print(f"[DEBUG] About to send initial hands to players...")
+            try:
+                room_players_for_hands = await asyncio.wait_for(
+                    loop.run_in_executor(executor, self.redis_manager.get_room_players, room_code),
+                    timeout=2.0
+                )
+                print(f"[DEBUG] Got room players for sending hands: {len(room_players_for_hands)}")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Redis timeout when getting room players for hands, using connected players")
+                # Fallback: use network manager to get connections
+                room_players_for_hands = []
+                for ws, metadata in self.network_manager.connection_metadata.items():
+                    if metadata.get('room_code') == room_code:
+                        room_players_for_hands.append({
+                            'username': metadata.get('username', f'Player{len(room_players_for_hands)+1}'),
+                            'player_id': metadata.get('player_id')
+                        })
+                        if len(room_players_for_hands) >= len(players):
+                            break
+            except Exception as e:
+                print(f"[DEBUG] Could not get room players for hands: {e}, using basic fallback")
+                room_players_for_hands = [{'username': name, 'player_id': f'fallback_{i}'} for i, name in enumerate(players)]
+            
+            print(f"[DEBUG] Got room players for hands, starting to send messages...")
+            for i, player in enumerate(room_players_for_hands):
+                print(f"[DEBUG] Sending hand to player {i+1}: {player.get('username', 'unknown')}")
                 ws = self.network_manager.get_live_connection(player['player_id'])
                 if ws:
+                    print(f"[DEBUG] Found live connection for player {player.get('username')}")
                     await self.network_manager.send_message(
                         ws,
                         'initial_deal',
@@ -263,6 +472,9 @@ class GameServer:
                             'message': "You are the Hakem. Choose hokm." if player['username'] == game.hakem else f"Waiting for {game.hakem} to choose hokm."
                         }
                     )
+                    print(f"[DEBUG] Sent initial hand to {player.get('username')}")
+                else:
+                    print(f"[DEBUG] No live connection found for player {player.get('username')}")
             
             print(f"[LOG] Game started in room {room_code}")
             
@@ -421,6 +633,10 @@ class GameServer:
     async def handle_hokm_selection(self, websocket, message):
         """Handle hokm selection by the Hakem, save state, broadcast, and deal remaining cards."""
         try:
+            # Create executor and loop for timeout operations
+            executor = concurrent.futures.ThreadPoolExecutor()
+            loop = asyncio.get_event_loop()
+            
             room_code = message.get('room_code')
             suit = message.get('suit')
             if not room_code or not suit:
@@ -437,65 +653,185 @@ class GameServer:
             if not game.set_hokm(suit, self.redis_manager, room_code):
                 await self.network_manager.notify_error(websocket, "Invalid hokm selection or wrong phase.")
                 return
-            # Save state after hokm selection
-            game_state = game.to_redis_dict()
-            self.redis_manager.save_game_state(room_code, game_state)
-            # Broadcast hokm selection
-            await self.network_manager.broadcast_to_room(
-                room_code,
-                'hokm_selected',
-                {'suit': game.hokm, 'hakem': game.hakem},
-                self.redis_manager
-            )
+            # Save state after hokm selection with timeout
+            try:
+                game_state = game.to_redis_dict()
+                await asyncio.wait_for(
+                    loop.run_in_executor(executor, self.redis_manager.save_game_state, room_code, game_state),
+                    timeout=2.0
+                )
+                print(f"[DEBUG] Saved hokm state to Redis")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Redis timeout when saving hokm state, continuing anyway")
+            except Exception as e:
+                print(f"[DEBUG] Could not save hokm state: {e}, continuing anyway")
+                
+            # Broadcast hokm selection with timeout protection
+            try:
+                await asyncio.wait_for(
+                    self.network_manager.broadcast_to_room(
+                        room_code,
+                        'hokm_selected',
+                        {'suit': game.hokm, 'hakem': game.hakem},
+                        self.redis_manager
+                    ),
+                    timeout=3.0
+                )
+                print(f"[DEBUG] Hokm selection broadcasted")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Timeout broadcasting hokm selection, trying direct network broadcast")
+                # Fallback: broadcast directly to network connections
+                for ws, metadata in self.network_manager.connection_metadata.items():
+                    if metadata.get('room_code') == room_code:
+                        try:
+                            await self.network_manager.send_message(
+                                ws,
+                                'hokm_selected',
+                                {'suit': game.hokm, 'hakem': game.hakem}
+                            )
+                        except Exception as e:
+                            print(f"[DEBUG] Failed to send hokm selection to individual connection: {e}")
+            except Exception as e:
+                print(f"[DEBUG] Error broadcasting hokm selection: {e}")
+                
             # Phase change: FINAL_DEAL
             game.game_phase = GameState.FINAL_DEAL.value if hasattr(GameState, 'FINAL_DEAL') else 'final_deal'
-            game_state = game.to_redis_dict()
-            self.redis_manager.save_game_state(room_code, game_state)
+            
+            # Save state after phase change with timeout
+            try:
+                game_state = game.to_redis_dict()
+                await asyncio.wait_for(
+                    loop.run_in_executor(executor, self.redis_manager.save_game_state, room_code, game_state),
+                    timeout=2.0
+                )
+                print(f"[DEBUG] Saved FINAL_DEAL phase state to Redis")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Redis timeout when saving FINAL_DEAL state, continuing anyway")
+            except Exception as e:
+                print(f"[DEBUG] Could not save FINAL_DEAL state: {e}, continuing anyway")
             
             # Broadcast phase change - CRITICAL for game progression
             print(f"[LOG] Broadcasting phase change to FINAL_DEAL in room {room_code}")
-            await self.network_manager.broadcast_to_room(
-                room_code,
-                'phase_change',
-                {'new_phase': game.game_phase},
-                self.redis_manager
-            )
+            try:
+                await asyncio.wait_for(
+                    self.network_manager.broadcast_to_room(
+                        room_code,
+                        'phase_change',
+                        {'new_phase': game.game_phase},
+                        self.redis_manager
+                    ),
+                    timeout=3.0
+                )
+                print(f"[DEBUG] FINAL_DEAL phase change broadcasted")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Timeout broadcasting FINAL_DEAL phase change, trying direct network broadcast")
+                # Fallback: broadcast directly to network connections
+                for ws, metadata in self.network_manager.connection_metadata.items():
+                    if metadata.get('room_code') == room_code:
+                        try:
+                            await self.network_manager.send_message(
+                                ws,
+                                'phase_change',
+                                {'new_phase': game.game_phase}
+                            )
+                        except Exception as e:
+                            print(f"[DEBUG] Failed to send phase change to individual connection: {e}")
+            except Exception as e:
+                print(f"[DEBUG] Error broadcasting FINAL_DEAL phase change: {e}")
             # Deal remaining cards and save state
             final_hands = game.final_deal(self.redis_manager)
+            print(f"[DEBUG] Final deal completed, hands: {len(final_hands) if final_hands else 0}")
             
             # Use broadcast instead of individual sends to handle disconnected players
-            await self.network_manager.broadcast_to_room(
-                room_code,
-                'final_deal',
-                {
-                    'hokm': game.hokm,
-                    'message': f'Hokm is {game.hokm}. Final deal completed.'
-                },
-                self.redis_manager
-            )
+            try:
+                await asyncio.wait_for(
+                    self.network_manager.broadcast_to_room(
+                        room_code,
+                        'final_deal',
+                        {
+                            'hokm': game.hokm,
+                            'message': f'Hokm is {game.hokm}. Final deal completed.'
+                        },
+                        self.redis_manager
+                    ),
+                    timeout=3.0
+                )
+                print(f"[DEBUG] Final deal message broadcasted")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Timeout broadcasting final deal message, trying direct network broadcast")
+                # Fallback: broadcast directly to network connections
+                for ws, metadata in self.network_manager.connection_metadata.items():
+                    if metadata.get('room_code') == room_code:
+                        try:
+                            await self.network_manager.send_message(
+                                ws,
+                                'final_deal',
+                                {
+                                    'hokm': game.hokm,
+                                    'message': f'Hokm is {game.hokm}. Final deal completed.'
+                                }
+                            )
+                        except Exception as e:
+                            print(f"[DEBUG] Failed to send final deal message to individual connection: {e}")
+            except Exception as e:
+                print(f"[DEBUG] Error broadcasting final deal message: {e}")
             
             # Send individual hands to each player (this will store hands for disconnected players)
-            for player in self.redis_manager.get_room_players(room_code):
+            try:
+                room_players_for_final = await asyncio.wait_for(
+                    loop.run_in_executor(executor, self.redis_manager.get_room_players, room_code),
+                    timeout=2.0
+                )
+                print(f"[DEBUG] Got room players for final hands: {len(room_players_for_final)}")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Redis timeout when getting room players for final hands, using connected players")
+                # Fallback: use network manager to get connections
+                room_players_for_final = []
+                for ws, metadata in self.network_manager.connection_metadata.items():
+                    if metadata.get('room_code') == room_code:
+                        room_players_for_final.append({
+                            'username': metadata.get('username', f'Player{len(room_players_for_final)+1}'),
+                            'player_id': metadata.get('player_id')
+                        })
+            except Exception as e:
+                print(f"[DEBUG] Could not get room players for final hands: {e}, using basic fallback")
+                room_players_for_final = []
+                
+            for player in room_players_for_final:
                 player_username = player['username']
                 player_hand = final_hands.get(player_username, [])
                 
-                # Try to send to live connection, but don't fail if disconnected
-                # The hand data is already saved in Redis via final_deal()
+                print(f"[DEBUG] Sending final hand to player {player_username}: {len(player_hand)} cards")
                 ws = self.network_manager.get_live_connection(player['player_id'])
                 if ws:
-                    await self.network_manager.send_message(
-                        ws,
-                        'final_deal',
-                        {
-                            'hand': player_hand,
-                            'hokm': game.hokm
-                        }
-                    )
+                    try:
+                        await self.network_manager.send_message(
+                            ws,
+                            'final_deal',
+                            {
+                                'hand': player_hand,
+                                'hokm': game.hokm
+                            }
+                        )
+                        print(f"[DEBUG] Final hand sent to {player_username}")
+                    except Exception as e:
+                        print(f"[DEBUG] Failed to send final hand to {player_username}: {e}")
                 else:
                     print(f"[DEBUG] Player {player_username} is disconnected, hand saved in Redis for later retrieval")
-            # Save state after final deal
-            game_state = game.to_redis_dict()
-            self.redis_manager.save_game_state(room_code, game_state)
+                    
+            # Save state after final deal with timeout
+            try:
+                game_state = game.to_redis_dict()
+                await asyncio.wait_for(
+                    loop.run_in_executor(executor, self.redis_manager.save_game_state, room_code, game_state),
+                    timeout=2.0
+                )
+                print(f"[DEBUG] Saved final deal state to Redis")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Redis timeout when saving final deal state, continuing anyway")
+            except Exception as e:
+                print(f"[DEBUG] Could not save final deal state: {e}, continuing anyway")
+                
             # Start first trick (which will send phase_change to GAMEPLAY)
             await self.start_first_trick(room_code)
         except Exception as e:
@@ -555,34 +891,96 @@ class GameServer:
             if not result.get('valid', True):
                 await self.network_manager.notify_error(websocket, result.get('message', 'Invalid move'))
                 return
-            # Save state after card play
-            game_state = game.to_redis_dict()
-            self.redis_manager.save_game_state(room_code, game_state)
-            # Broadcast card play
-            await self.network_manager.broadcast_to_room(
-                room_code,
-                'card_played',
-                {'player': player, 'card': card, 'team': game.teams.get(player, 0) + 1, 'player_id': player_id},
-                self.redis_manager
-            )
+            # Save state after card play with timeout protection
+            try:
+                executor = concurrent.futures.ThreadPoolExecutor()
+                loop = asyncio.get_event_loop()
+                game_state = game.to_redis_dict()
+                await asyncio.wait_for(
+                    loop.run_in_executor(executor, self.redis_manager.save_game_state, room_code, game_state),
+                    timeout=2.0
+                )
+                print(f"[DEBUG] Saved card play state to Redis")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Redis timeout when saving card play state, continuing anyway")
+            except Exception as e:
+                print(f"[DEBUG] Could not save card play state: {e}, continuing anyway")
+                
+            # Broadcast card play with timeout protection
+            try:
+                await asyncio.wait_for(
+                    self.network_manager.broadcast_to_room(
+                        room_code,
+                        'card_played',
+                        {'player': player, 'card': card, 'team': game.teams.get(player, 0) + 1, 'player_id': player_id},
+                        self.redis_manager
+                    ),
+                    timeout=3.0
+                )
+                print(f"[DEBUG] Card play broadcasted")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Timeout broadcasting card play, trying direct network broadcast")
+                # Fallback: broadcast directly to network connections
+                for ws, metadata in self.network_manager.connection_metadata.items():
+                    if metadata.get('room_code') == room_code:
+                        try:
+                            await self.network_manager.send_message(
+                                ws,
+                                'card_played',
+                                {'player': player, 'card': card, 'team': game.teams.get(player, 0) + 1, 'player_id': player_id}
+                            )
+                        except Exception as e:
+                            print(f"[DEBUG] Failed to send card play to individual connection: {e}")
+            except Exception as e:
+                print(f"[DEBUG] Error broadcasting card play: {e}")
             
             # Send turn_start for next player if trick is not complete
             if not result.get('trick_complete'):
                 next_player = result.get('next_turn')
                 if next_player:
-                    for player_info in self.redis_manager.get_room_players(room_code):
+                    try:
+                        room_players_for_turn = await asyncio.wait_for(
+                            loop.run_in_executor(executor, self.redis_manager.get_room_players, room_code),
+                            timeout=2.0
+                        )
+                        print(f"[DEBUG] Got room players for next turn: {len(room_players_for_turn)}")
+                    except asyncio.TimeoutError:
+                        print(f"[DEBUG] Redis timeout when getting room players for next turn, using connected players")
+                        # Fallback: use network manager to get connections
+                        room_players_for_turn = []
+                        for ws, metadata in self.network_manager.connection_metadata.items():
+                            if metadata.get('room_code') == room_code:
+                                room_players_for_turn.append({
+                                    'username': metadata.get('username', f'Player{len(room_players_for_turn)+1}'),
+                                    'player_id': metadata.get('player_id')
+                                })
+                    except Exception as e:
+                        print(f"[DEBUG] Could not get room players for next turn: {e}, using basic fallback")
+                        room_players_for_turn = []
+                    
+                    for player_info in room_players_for_turn:
                         ws = self.network_manager.get_live_connection(player_info['player_id'])
-                        if ws:
-                            await self.network_manager.send_message(
-                                ws,
-                                "turn_start",
-                                {
-                                    "current_player": next_player,
-                                    "your_turn": player_info['username'] == next_player,
-                                    "hand": game.hands[player_info['username']][:],
-                                    "hokm": game.hokm
-                                }
-                            )
+                        if ws and player_info['username'] in game.hands:
+                            try:
+                                await self.network_manager.send_message(
+                                    ws,
+                                    "turn_start",
+                                    {
+                                        "current_player": next_player,
+                                        "your_turn": player_info['username'] == next_player,
+                                        "hand": game.hands[player_info['username']][:],
+                                        "hokm": game.hokm,
+                                        "message": f"It's {next_player}'s turn"
+                                    }
+                                )
+                                print(f"[DEBUG] Sent turn_start to {player_info['username']} for next player {next_player}")
+                            except Exception as e:
+                                print(f"[DEBUG] Failed to send turn_start to {player_info['username']}: {e}")
+                        else:
+                            if not ws:
+                                print(f"[DEBUG] Player {player_info['username']} is disconnected during turn transition")
+                            if player_info['username'] not in game.hands:
+                                print(f"[DEBUG] Player {player_info['username']} has no hand data during turn transition")
             
             # If trick complete, broadcast trick result and save state
             if result.get('trick_complete'):
@@ -607,19 +1005,49 @@ class GameServer:
                 if not result.get('hand_complete'):
                     trick_winner = result.get('trick_winner')
                     if trick_winner:
-                        for player_info in self.redis_manager.get_room_players(room_code):
+                        try:
+                            room_players_for_next_trick = await asyncio.wait_for(
+                                loop.run_in_executor(executor, self.redis_manager.get_room_players, room_code),
+                                timeout=2.0
+                            )
+                            print(f"[DEBUG] Got room players for next trick: {len(room_players_for_next_trick)}")
+                        except asyncio.TimeoutError:
+                            print(f"[DEBUG] Redis timeout when getting room players for next trick, using connected players")
+                            # Fallback: use network manager to get connections
+                            room_players_for_next_trick = []
+                            for ws, metadata in self.network_manager.connection_metadata.items():
+                                if metadata.get('room_code') == room_code:
+                                    room_players_for_next_trick.append({
+                                        'username': metadata.get('username', f'Player{len(room_players_for_next_trick)+1}'),
+                                        'player_id': metadata.get('player_id')
+                                    })
+                        except Exception as e:
+                            print(f"[DEBUG] Could not get room players for next trick: {e}, using basic fallback")
+                            room_players_for_next_trick = []
+                        
+                        for player_info in room_players_for_next_trick:
                             ws = self.network_manager.get_live_connection(player_info['player_id'])
-                            if ws:
-                                await self.network_manager.send_message(
-                                    ws,
-                                    "turn_start",
-                                    {
-                                        "current_player": trick_winner,
-                                        "your_turn": player_info['username'] == trick_winner,
-                                        "hand": game.hands[player_info['username']][:],
-                                        "hokm": game.hokm
-                                    }
-                                )
+                            if ws and player_info['username'] in game.hands:
+                                try:
+                                    await self.network_manager.send_message(
+                                        ws,
+                                        "turn_start",
+                                        {
+                                            "current_player": trick_winner,
+                                            "your_turn": player_info['username'] == trick_winner,
+                                            "hand": game.hands[player_info['username']][:],
+                                            "hokm": game.hokm,
+                                            "message": f"{trick_winner} won the trick and leads next"
+                                        }
+                                    )
+                                    print(f"[DEBUG] Sent turn_start to {player_info['username']} for trick winner {trick_winner}")
+                                except Exception as e:
+                                    print(f"[DEBUG] Failed to send turn_start to {player_info['username']}: {e}")
+                            else:
+                                if not ws:
+                                    print(f"[DEBUG] Player {player_info['username']} is disconnected during trick transition")
+                                if player_info['username'] not in game.hands:
+                                    print(f"[DEBUG] Player {player_info['username']} has no hand data during trick transition")
                 
                 # If hand complete, broadcast hand and round completion and save state
                 if result.get('hand_complete'):
@@ -672,55 +1100,113 @@ class GameServer:
 
     async def start_first_trick(self, room_code):
         """Initialize the first trick after hokm selection"""
-        game = self.active_games[room_code]
-        game.current_turn = 0  # Hakem leads first trick
-        first_player = game.players[game.current_turn]
-        
-        print(f"\n=== Starting first trick in room {room_code} ===")
-        print(f"{first_player} (Hakem) leads the first trick")
-        
-        # Update phase to gameplay
-        game.game_phase = GameState.GAMEPLAY.value
-        
-        # Save updated game state after initiating first trick
-        game_state = game.to_redis_dict()
-        self.redis_manager.save_game_state(room_code, game_state)
-        
-        # Broadcast phase change to gameplay
-        await self.network_manager.broadcast_to_room(
-            room_code,
-            'phase_change',
-            {'new_phase': GameState.GAMEPLAY.value},
-            self.redis_manager
-        )
-        
-        # Notify all players whose turn it is - use broadcast for better disconnection handling
-        await self.network_manager.broadcast_to_room(
-            room_code,
-            "turn_start",
-            {
-                "current_player": first_player,
-                "message": f"{first_player} (Hakem) leads the first trick"
-            },
-            self.redis_manager
-        )
-        
-        # Send individual turn info to each player
-        for player in self.redis_manager.get_room_players(room_code):
-            player_username = player['username']
-            ws = self.network_manager.get_live_connection(player['player_id'])
-            if ws:
-                await self.network_manager.send_message(
-                    ws,
-                    "turn_start",
-                    {
-                        "current_player": first_player,
-                        "your_turn": player_username == first_player,
-                        "hand": game.hands[player_username][:]
-                    }
+        try:
+            executor = concurrent.futures.ThreadPoolExecutor()
+            loop = asyncio.get_event_loop()
+            
+            game = self.active_games[room_code]
+            game.current_turn = 0  # Hakem leads first trick
+            first_player = game.players[game.current_turn]
+            
+            print(f"\n=== Starting first trick in room {room_code} ===")
+            print(f"{first_player} (Hakem) leads the first trick")
+            
+            # Update phase to gameplay
+            game.game_phase = GameState.GAMEPLAY.value
+            
+            # Save updated game state after initiating first trick with timeout
+            try:
+                game_state = game.to_redis_dict()
+                await asyncio.wait_for(
+                    loop.run_in_executor(executor, self.redis_manager.save_game_state, room_code, game_state),
+                    timeout=2.0
                 )
-            else:
-                print(f"[DEBUG] Player {player_username} is disconnected during first trick start")
+                print(f"[DEBUG] Saved gameplay phase state to Redis")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Redis timeout when saving gameplay state, continuing anyway")
+            except Exception as e:
+                print(f"[DEBUG] Could not save gameplay state: {e}, continuing anyway")
+            
+            # Broadcast phase change to gameplay with timeout protection
+            try:
+                await asyncio.wait_for(
+                    self.network_manager.broadcast_to_room(
+                        room_code,
+                        'phase_change',
+                        {'new_phase': GameState.GAMEPLAY.value},
+                        self.redis_manager
+                    ),
+                    timeout=3.0
+                )
+                print(f"[DEBUG] GAMEPLAY phase change broadcasted")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Timeout broadcasting GAMEPLAY phase change, trying direct network broadcast")
+                # Fallback: broadcast directly to network connections
+                for ws, metadata in self.network_manager.connection_metadata.items():
+                    if metadata.get('room_code') == room_code:
+                        try:
+                            await self.network_manager.send_message(
+                                ws,
+                                'phase_change',
+                                {'new_phase': GameState.GAMEPLAY.value}
+                            )
+                        except Exception as e:
+                            print(f"[DEBUG] Failed to send phase change to individual connection: {e}")
+            except Exception as e:
+                print(f"[DEBUG] Error broadcasting GAMEPLAY phase change: {e}")
+            
+            # Get room players with timeout protection
+            try:
+                room_players = await asyncio.wait_for(
+                    loop.run_in_executor(executor, self.redis_manager.get_room_players, room_code),
+                    timeout=2.0
+                )
+                print(f"[DEBUG] Got room players for turn start: {len(room_players)}")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Redis timeout when getting room players for turn start, using connected players")
+                # Fallback: use network manager to get connections
+                room_players = []
+                for ws, metadata in self.network_manager.connection_metadata.items():
+                    if metadata.get('room_code') == room_code:
+                        room_players.append({
+                            'username': metadata.get('username', f'Player{len(room_players)+1}'),
+                            'player_id': metadata.get('player_id')
+                        })
+            except Exception as e:
+                print(f"[DEBUG] Could not get room players for turn start: {e}, using basic fallback")
+                room_players = []
+            
+            # Send individual turn info to each player with hand data
+            for player in room_players:
+                player_username = player['username']
+                player_id = player['player_id']
+                
+                ws = self.network_manager.get_live_connection(player_id)
+                if ws and player_username in game.hands:
+                    try:
+                        await self.network_manager.send_message(
+                            ws,
+                            "turn_start",
+                            {
+                                "current_player": first_player,
+                                "your_turn": player_username == first_player,
+                                "hand": game.hands[player_username][:],
+                                "hokm": game.hokm,
+                                "message": f"{first_player} (Hakem) leads the first trick"
+                            }
+                        )
+                        print(f"[DEBUG] Sent turn_start with hand to {player_username}: {len(game.hands[player_username])} cards")
+                    except Exception as e:
+                        print(f"[DEBUG] Failed to send turn_start to {player_username}: {e}")
+                else:
+                    if not ws:
+                        print(f"[DEBUG] Player {player_username} is disconnected during first trick start")
+                    if player_username not in game.hands:
+                        print(f"[DEBUG] Player {player_username} has no hand data")
+                        
+        except Exception as e:
+            print(f"[ERROR] Failed to start first trick: {str(e)}")
+            traceback.print_exc()
 
     async def handle_clear_room(self, websocket, message):
         # TEMPORARY: Admin/dev command to clear a room (for development/testing only)
@@ -1094,19 +1580,22 @@ class GameServer:
             print(f"[ERROR] Health check failed: {str(e)}")
             await self.network_manager.notify_error(websocket, f"Health check failed: {str(e)}")
 
-async def cleanup_task():
+async def cleanup_task(server_instance):
     """Periodic task to cleanup expired sessions, inactive rooms, and stale connections"""
+    # Wait for server to fully start before beginning cleanup
+    await asyncio.sleep(30)
+    print("[LOG] Cleanup task starting periodic maintenance...")
+    
     while True:
         try:
-            # Get global game server instance
-            global game_server
-            if not game_server:
+            # Use the passed server instance instead of global
+            if not server_instance:
                 await asyncio.sleep(300)
                 continue
                 
             # Check for dead connections by attempting to ping them
             dead_connections = []
-            for ws, metadata in list(game_server.network_manager.connection_metadata.items()):
+            for ws, metadata in list(server_instance.network_manager.connection_metadata.items()):
                 try:
                     # Try to ping the connection
                     pong_waiter = await ws.ping()
@@ -1118,40 +1607,40 @@ async def cleanup_task():
             # Handle dead connections
             for ws in dead_connections:
                 try:
-                    await game_server.handle_connection_closed(ws)
+                    await server_instance.handle_connection_closed(ws)
                 except Exception as e:
                     print(f"[ERROR] Error handling dead connection: {str(e)}")
             
             # Cleanup expired sessions from Redis
-            game_server.redis_manager.cleanup_expired_sessions()
+            server_instance.redis_manager.cleanup_expired_sessions()
             
             current_time = int(time.time())
             
             # Check and cleanup stale connections (fallback)
-            for ws, metadata in list(game_server.network_manager.connection_metadata.items()):
+            for ws, metadata in list(server_instance.network_manager.connection_metadata.items()):
                 connected_at = metadata.get('connected_at', 0)
                 if current_time - connected_at > 7200:  # 2 hours without activity
                     print(f"[LOG] Removing stale connection for player {metadata.get('player_id')}")
                     try:
-                        await game_server.handle_connection_closed(ws)
+                        await server_instance.handle_connection_closed(ws)
                     except Exception as e:
                         print(f"[ERROR] Error removing stale connection: {str(e)}")
             
             # Check for inactive rooms in Redis by scanning for room keys
-            for key in game_server.redis_manager.redis.scan_iter("room:*:players"):
+            for key in server_instance.redis_manager.redis.scan_iter("room:*:players"):
                 try:
                     room_code = key.decode().split(':')[1]  # Extract room code from key
-                    if game_server.redis_manager.room_exists(room_code):
-                        game_state = game_server.redis_manager.get_game_state(room_code)
+                    if server_instance.redis_manager.room_exists(room_code):
+                        game_state = server_instance.redis_manager.get_game_state(room_code)
                         if game_state:
                             last_activity = int(game_state.get('last_activity', '0'))
                             if current_time - last_activity > 3600:  # 1 hour inactivity
                                 print(f"[LOG] Cleaning up inactive room {room_code}")
-                                game_server.redis_manager.delete_room(room_code)
+                                server_instance.redis_manager.delete_room(room_code)
                                 
                                 # Remove from active games if exists
-                                if room_code in game_server.active_games:
-                                    del game_server.active_games[room_code]
+                                if room_code in server_instance.active_games:
+                                    del server_instance.active_games[room_code]
                 except Exception as e:
                     print(f"[ERROR] Error checking room {room_code}: {str(e)}")
                     
@@ -1164,9 +1653,11 @@ async def cleanup_task():
 
 async def main():
     print("Starting Hokm WebSocket server on ws://0.0.0.0:8765")
-    global game_server
+    print("[DEBUG] Creating GameServer instance...")
     game_server = GameServer()
+    print("[DEBUG] Loading games from Redis...")
     game_server.load_active_games_from_redis()
+    print("[DEBUG] Server initialization complete")
 
     async def handle_connection(websocket, path):
         """Handle new WebSocket connections with ping/pong health checks"""
@@ -1236,20 +1727,24 @@ async def main():
             # Handle disconnection regardless of how the connection ended
             await game_server.handle_connection_closed(websocket)
     
-    # Start cleanup task
-    cleanup_loop = asyncio.create_task(cleanup_task())
+    # Start cleanup task with server instance (disabled for debugging)
+    print("[DEBUG] Skipping cleanup task for now...")
+    # cleanup_loop = asyncio.create_task(cleanup_task(game_server))
+    # print("[DEBUG] Cleanup task started")
     
     try:
-        async with websockets.serve(handle_connection, "0.0.0.0", 8765):
-            await asyncio.Future()  # Run forever
+        print("[DEBUG] Starting WebSocket server...")
+        server = await websockets.serve(handle_connection, "0.0.0.0", 8765)
+        print("[LOG] WebSocket server is now listening on ws://0.0.0.0:8765")
+        await server.wait_closed()  # Wait for server to be closed
     except Exception as e:
         print(f"[ERROR] Server error: {str(e)}")
-    finally:
-        cleanup_loop.cancel()
-        try:
-            await cleanup_loop
-        except asyncio.CancelledError:
-            pass
+    # finally:
+    #     cleanup_loop.cancel()
+    #     try:
+    #         await cleanup_loop
+    #     except asyncio.CancelledError:
+    #         pass
 
 if __name__ == "__main__":
     try:

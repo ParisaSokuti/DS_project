@@ -82,8 +82,40 @@ class NetworkManager:
         Room membership is checked from Redis but messages are sent only to live connections.
         """
         try:
-            # Get all players in room from Redis
-            players = redis_manager.get_room_players(room_code)
+            # Get all players in room from Redis with timeout protection
+            try:
+                import concurrent.futures
+                executor = concurrent.futures.ThreadPoolExecutor()
+                loop = asyncio.get_event_loop()
+                players = await asyncio.wait_for(
+                    loop.run_in_executor(executor, redis_manager.get_room_players, room_code),
+                    timeout=2.0
+                )
+                print(f"[DEBUG] Got {len(players)} players from Redis for broadcast")
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Redis timeout getting room players for broadcast, using network connections")
+                # Fallback: use network manager connections
+                players = []
+                for ws, metadata in self.connection_metadata.items():
+                    if metadata.get('room_code') == room_code:
+                        players.append({
+                            'player_id': metadata.get('player_id'),
+                            'username': f"Player{len(players)+1}",  # Fallback name
+                            'player_number': len(players) + 1
+                        })
+            except Exception as e:
+                print(f"[DEBUG] Error getting room players: {e}, using network connections fallback")
+                # Fallback: use network manager connections
+                players = []
+                for ws, metadata in self.connection_metadata.items():
+                    if metadata.get('room_code') == room_code:
+                        players.append({
+                            'player_id': metadata.get('player_id'),
+                            'username': f"Player{len(players)+1}",  # Fallback name
+                            'player_number': len(players) + 1
+                        })
+            
+            print(f"[DEBUG] Broadcasting {msg_type} to {len(players)} players in room {room_code}")
             
             # Send message only to players with live connections
             for player in players:
@@ -103,7 +135,9 @@ class NetworkManager:
                         })
                         
                         success = await self.send_message(ws, msg_type, player_data)
-                        if not success:
+                        if success:
+                            print(f"[DEBUG] Successfully sent {msg_type} to {player.get('username')}")
+                        else:
                             print(f"[WARNING] Failed to send message to {player.get('username')}")
                             # Remove failed connection
                             self.remove_connection(ws)
@@ -114,20 +148,30 @@ class NetworkManager:
                 else:
                     print(f"[INFO] Player {player.get('username')} has no live connection")
                     
-            # Always persist broadcast in Redis for state recovery
-            broadcast_key = f"broadcast:{room_code}:{int(time.time())}"
-            redis_manager.redis.set(
-                broadcast_key,
-                json.dumps({
-                    'type': msg_type,
-                    'data': data,
-                    'timestamp': time.time()
-                }),
-                ex=3600  # Expire after 1 hour
-            )
+            # Always persist broadcast in Redis for state recovery (with timeout)
+            try:
+                broadcast_key = f"broadcast:{room_code}:{int(time.time())}"
+                await asyncio.wait_for(
+                    loop.run_in_executor(executor, redis_manager.redis.set,
+                        broadcast_key,
+                        json.dumps({
+                            'type': msg_type,
+                            'data': data,
+                            'timestamp': time.time()
+                        }),
+                        3600  # Expire after 1 hour
+                    ),
+                    timeout=1.0
+                )
+            except asyncio.TimeoutError:
+                print(f"[DEBUG] Redis timeout when saving broadcast, continuing anyway")
+            except Exception as e:
+                print(f"[DEBUG] Could not save broadcast to Redis: {e}, continuing anyway")
                     
         except Exception as e:
             print(f"[ERROR] Failed to broadcast to room {room_code}: {str(e)}")
+            import traceback
+            traceback.print_exc()
             
         # Log broadcast for debugging
         print(f"[DEBUG] Broadcast {msg_type} to room {room_code}")
