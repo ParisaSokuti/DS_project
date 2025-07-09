@@ -194,7 +194,7 @@ class GameServer:
                 print(f"[DEBUG] Could not save session data: {e}, continuing anyway")
 
             # Register live connection
-            self.network_manager.register_connection(websocket, player_id, room_code)
+            self.network_manager.register_connection(websocket, player_id, room_code, username)
             
             # Debug: check connection count immediately after registration
             debug_count = 0
@@ -288,16 +288,16 @@ class GameServer:
             except asyncio.TimeoutError:
                 print(f"[DEBUG] Redis timeout when getting room players, using network manager fallback")
                 # Fallback: get players from network manager connections
-                connected_players_count = 0
+                players = []
                 for ws, metadata in self.network_manager.connection_metadata.items():
                     if metadata.get('room_code') == room_code:
-                        connected_players_count += 1
+                        username = metadata.get('username', f'Player{len(players)+1}')
+                        players.append(username)
                 
-                if connected_players_count >= ROOM_SIZE:
-                    players = [f"Player{i+1}" for i in range(ROOM_SIZE)]  # Fallback player names
-                    print(f"[DEBUG] Using fallback players: {players}")
+                if len(players) >= ROOM_SIZE:
+                    print(f"[DEBUG] Using fallback players from network manager: {players}")
                 else:
-                    print(f"[ERROR] Not enough connected players for fallback: {connected_players_count}")
+                    print(f"[ERROR] Not enough connected players for fallback: {len(players)}")
                     return
             except Exception as e:
                 print(f"[ERROR] Could not get room players: {e}")
@@ -853,7 +853,7 @@ class GameServer:
             game = self.active_games[room_code]
             
             # Enhanced player lookup with debugging and fallback
-            player, player_id = self.find_player_by_websocket(websocket, room_code)
+            player, player_id = await self.find_player_by_websocket(websocket, room_code)
             if not player:
                 error_msg = f"Player not found in room. player_id='{player_id}', room='{room_code}'"
                 print(f"[ERROR] {error_msg}")
@@ -874,6 +874,10 @@ class GameServer:
             # Play card and update state
             try:
                 result = game.play_card(player, card, self.redis_manager)
+                print(f"[DEBUG] play_card result: {result}")
+                print(f"[DEBUG] trick_complete: {result.get('trick_complete')}")
+                print(f"[DEBUG] next_turn: {result.get('next_turn')}")
+                print(f"[DEBUG] current_turn after play: {getattr(game, 'current_turn', 'MISSING')}")
             except ValueError as ve:
                 # This catches invalid game state errors (e.g., invalid trick resolution)
                 error_msg = f"Invalid game state during card play: {str(ve)}"
@@ -937,7 +941,9 @@ class GameServer:
             # Send turn_start for next player if trick is not complete
             if not result.get('trick_complete'):
                 next_player = result.get('next_turn')
+                print(f"[DEBUG] Trick not complete, next_player: {next_player}")
                 if next_player:
+                    print(f"[DEBUG] About to send turn_start to next player: {next_player}")
                     try:
                         room_players_for_turn = await asyncio.wait_for(
                             loop.run_in_executor(executor, self.redis_manager.get_room_players, room_code),
@@ -958,6 +964,7 @@ class GameServer:
                         print(f"[DEBUG] Could not get room players for next turn: {e}, using basic fallback")
                         room_players_for_turn = []
                     
+                    print(f"[DEBUG] Sending turn_start to {len(room_players_for_turn)} players")
                     for player_info in room_players_for_turn:
                         ws = self.network_manager.get_live_connection(player_info['player_id'])
                         if ws and player_info['username'] in game.hands:
@@ -981,6 +988,10 @@ class GameServer:
                                 print(f"[DEBUG] Player {player_info['username']} is disconnected during turn transition")
                             if player_info['username'] not in game.hands:
                                 print(f"[DEBUG] Player {player_info['username']} has no hand data during turn transition")
+                else:
+                    print(f"[DEBUG] No next_player found in result!")
+            else:
+                print(f"[DEBUG] Trick is complete, not sending turn_start")
             
             # If trick complete, broadcast trick result and save state
             if result.get('trick_complete'):
@@ -1105,11 +1116,32 @@ class GameServer:
             loop = asyncio.get_event_loop()
             
             game = self.active_games[room_code]
-            game.current_turn = 0  # Hakem leads first trick
+            
+            # Find the hakem's index in the players list
+            try:
+                hakem_index = game.players.index(game.hakem)
+            except ValueError:
+                print(f"[ERROR] Hakem {game.hakem} not found in players list {game.players}")
+                # Fallback: assume hakem is at index 0
+                hakem_index = 0
+                
+            game.current_turn = hakem_index  # Hakem leads first trick
             first_player = game.players[game.current_turn]
             
             print(f"\n=== Starting first trick in room {room_code} ===")
+            print(f"Hakem: {game.hakem}")
+            print(f"Players order: {game.players}")
+            print(f"Hakem index: {hakem_index}")
             print(f"{first_player} (Hakem) leads the first trick")
+            print(f"Current turn set to: {game.current_turn}")
+            
+            # Verify that the first player is actually the hakem
+            if first_player != game.hakem:
+                print(f"[WARNING] First player {first_player} is not the hakem {game.hakem}!")
+                # Force the hakem to be the current player
+                game.current_turn = game.players.index(game.hakem)
+                first_player = game.hakem
+                print(f"[FIX] Corrected current_turn to {game.current_turn} for hakem {game.hakem}")
             
             # Update phase to gameplay
             game.game_phase = GameState.GAMEPLAY.value
@@ -1220,27 +1252,73 @@ class GameServer:
             del self.active_games[room_code]
         await self.network_manager.notify_info(websocket, f"Room {room_code} has been cleared.")
 
-    def find_player_by_websocket(self, websocket, room_code):
+    async def find_player_by_websocket(self, websocket, room_code):
         """Enhanced player lookup with multiple fallback mechanisms"""
-        room_players = self.redis_manager.get_room_players(room_code)
+        print(f"[DEBUG] find_player_by_websocket called for room {room_code}")
+        print(f"[DEBUG] About to call redis_manager.get_room_players...")
+        
+        # Create executor and loop for timeout operations
+        executor = concurrent.futures.ThreadPoolExecutor()
+        loop = asyncio.get_event_loop()
+        
+        try:
+            room_players = await asyncio.wait_for(
+                loop.run_in_executor(executor, self.redis_manager.get_room_players, room_code),
+                timeout=2.0
+            )
+            print(f"[DEBUG] get_room_players returned {len(room_players)} players")
+        except asyncio.TimeoutError:
+            print(f"[DEBUG] Redis timeout when getting room players, using fallback")
+            # Fallback: use network manager to get connections
+            room_players = []
+            for ws, metadata in self.network_manager.connection_metadata.items():
+                if metadata.get('room_code') == room_code:
+                    room_players.append({
+                        'username': metadata.get('username'),
+                        'player_id': metadata.get('player_id'),
+                        'connection_status': 'active'
+                    })
+            print(f"[DEBUG] Using {len(room_players)} fallback players")
+        except Exception as e:
+            print(f"[DEBUG] Error getting room players: {e}, using fallback")
+            # Fallback: use network manager to get connections
+            room_players = []
+            for ws, metadata in self.network_manager.connection_metadata.items():
+                if metadata.get('room_code') == room_code:
+                    room_players.append({
+                        'username': metadata.get('username'),
+                        'player_id': metadata.get('player_id'),
+                        'connection_status': 'active'
+                    })
+            print(f"[DEBUG] Using {len(room_players)} fallback players")
         
         # Method 1: Check connection metadata
         if websocket in self.network_manager.connection_metadata:
             conn_data = self.network_manager.connection_metadata[websocket]
             player_id = conn_data.get('player_id')
+            print(f"[DEBUG] Found connection metadata with player_id: {player_id}")
             if player_id:
                 for p in room_players:
+                    print(f"[DEBUG] Checking room player: {p}")
                     if p.get('player_id') == player_id:
+                        print(f"[DEBUG] Method 1 success: Found player {p.get('username')}")
                         return p.get('username'), player_id
+        else:
+            print(f"[DEBUG] Websocket not in connection_metadata")
         
         # Method 2: Check live connections
         if websocket in self.network_manager.live_connections:
             player_id = self.network_manager.live_connections[websocket]
+            print(f"[DEBUG] Found in live_connections with player_id: {player_id}")
             for p in room_players:
                 if p.get('player_id') == player_id:
+                    print(f"[DEBUG] Method 2 success: Found player {p.get('username')}")
                     return p.get('username'), player_id
+        else:
+            print(f"[DEBUG] Websocket not in live_connections")
         
         # Method 3: Find by room code match in connection metadata
+        print(f"[DEBUG] Trying method 3...")
         for p in room_players:
             if p.get('connection_status') == 'active':
                 # Try to find websocket for this player
@@ -1248,8 +1326,10 @@ class GameServer:
                     if (conn_data.get('room_code') == room_code and 
                         conn_data.get('player_id') == p.get('player_id')):
                         if ws == websocket:
+                            print(f"[DEBUG] Method 3 success: Found player {p.get('username')}")
                             return p.get('username'), p.get('player_id')
         
+        print(f"[DEBUG] All methods failed - player not found!")
         return None, None
 
     def repair_player_connection(self, websocket, room_code, username):
@@ -1274,7 +1354,7 @@ class GameServer:
                 self.redis_manager.add_player_to_room(room_code, p)
             
             # Update network manager
-            self.network_manager.register_connection(websocket, new_player_id, room_code)
+            self.network_manager.register_connection(websocket, new_player_id, room_code, username)
             
             print(f"[LOG] Repaired connection for {username} in room {room_code}")
             return new_player_id
@@ -1408,7 +1488,7 @@ class GameServer:
             self.redis_manager.save_player_session(player_id, session_data)
             
             # Register live connection
-            self.network_manager.register_connection(websocket, player_id, room_code)
+            self.network_manager.register_connection(websocket, player_id, room_code, username)
             
             # Update room player data
             self.redis_manager.update_player_in_room(room_code, player_id, updated_player_data)

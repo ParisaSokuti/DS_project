@@ -73,10 +73,30 @@ class GameBoard:
             team2_players[1]: 1
         }
         
+        print(f"[GAMEBOARD DEBUG] Teams assigned:")
+        print(f"  Team 0: {first_team1_player}, {second_team1_player}")
+        print(f"  Team 1: {team2_players[0]}, {team2_players[1]}")
+        print(f"  Teams dict: {self.teams}")
+        
         # Reorder players: Hakem first, then clockwise order
         hakem_idx = self.players.index(self.hakem)
+        old_order = self.players.copy()
         self.players = self.players[hakem_idx:] + self.players[:hakem_idx]
         self.current_turn = 0
+        
+        print(f"[GAMEBOARD DEBUG] Player reordering:")
+        print(f"  Original order: {old_order}")
+        print(f"  Hakem: {self.hakem} (was at index {hakem_idx})")
+        print(f"  New order: {self.players}")
+        print(f"  Hakem now at index: {self.players.index(self.hakem)}")
+        print(f"  Teams after reorder: {self.teams}")
+        
+        # Verify all players are in teams
+        for player in self.players:
+            if player not in self.teams:
+                print(f"[ERROR] Player {player} not found in teams!")
+            else:
+                print(f"  {player} -> Team {self.teams[player]}")
         
         self.game_phase = "initial_deal"
         
@@ -238,16 +258,25 @@ class GameBoard:
                 self.led_suit = card.split('_')[1]
             
             # Move to next player
+            old_turn = self.current_turn
             self.current_turn = (self.current_turn + 1) % 4
+            next_player = self.players[self.current_turn]
+            
+            print(f"[GAMEBOARD DEBUG] Turn transition: {self.players[old_turn]} -> {next_player}")
+            print(f"[GAMEBOARD DEBUG] current_turn index: {old_turn} -> {self.current_turn}")
+            print(f"[GAMEBOARD DEBUG] players list: {self.players}")
+            print(f"[GAMEBOARD DEBUG] trick length: {len(self.current_trick)}/4")
             
             result = {
                 "valid": True,
                 "trick_complete": False,
                 "player": player,
                 "card": card,
-                "next_turn": self.players[self.current_turn],
+                "next_turn": next_player,
                 "led_suit": self.led_suit
             }
+            
+            print(f"[GAMEBOARD DEBUG] Result next_turn: {result['next_turn']}")
             
             # Check if trick is complete
             if len(self.current_trick) == 4:

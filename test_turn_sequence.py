@@ -25,6 +25,7 @@ async def test_turn_sequence():
     try:
         # Create 4 player connections
         players = []
+        player_ids = []
         for i in range(4):
             ws = await websockets.connect("ws://localhost:8765")
             players.append(ws)
@@ -38,7 +39,9 @@ async def test_turn_sequence():
             
             # Read join response
             response = await ws.recv()
-            print(f"Player {i+1} joined: {json.loads(response)}")
+            join_data = json.loads(response)
+            player_ids.append(join_data.get('player_id'))
+            print(f"Player {i+1} joined: {join_data}")
         
         # Wait for all players to join and game to start
         await asyncio.sleep(1)
@@ -70,7 +73,7 @@ async def test_turn_sequence():
                                 await ws.send(json.dumps({
                                     'type': 'play_card',
                                     'room_code': '1234',
-                                    'player_id': f'test_player_{i+1}',
+                                    'player_id': player_ids[i],
                                     'card': card_to_play
                                 }))
                         

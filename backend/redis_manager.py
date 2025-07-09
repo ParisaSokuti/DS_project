@@ -381,8 +381,12 @@ class RedisManager:
                 if 'teams' not in state:
                     return False, f"Teams required for phase: {state['phase']}"
                 teams = json.loads(state['teams']) if isinstance(state['teams'], str) else state['teams']
-                if not isinstance(teams, dict) or len(teams) != 2:
-                    return False, "Invalid team structure"
+                if not isinstance(teams, dict) or len(teams) != 4:
+                    return False, "Invalid team structure - expected 4 players with team assignments"
+                # Validate that all team values are 0 or 1
+                for player, team in teams.items():
+                    if team not in [0, 1]:
+                        return False, f"Invalid team assignment for player {player}: {team}"
                     
             return True, ""
         except Exception as e:

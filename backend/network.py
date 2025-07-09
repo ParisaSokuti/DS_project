@@ -39,12 +39,13 @@ class NetworkManager:
             
             self.initialized = True
             
-    def register_connection(self, websocket, player_id: str, room_code: str):
+    def register_connection(self, websocket, player_id: str, room_code: str, username: str = None):
         """Register a new live WebSocket connection"""
         self.live_connections[player_id] = websocket
         self.connection_metadata[websocket] = {
             'player_id': player_id,
             'room_code': room_code,
+            'username': username,
             'connected_at': int(time.time())
         }
         
@@ -262,7 +263,7 @@ class NetworkManager:
             redis_manager.save_player_session(player_id, session_data)
             
             # 2. Register live connection
-            self.register_connection(websocket, player_id, room_code)
+            self.register_connection(websocket, player_id, room_code, username)
             
             # 3. Add to room with all metadata
             room_data = {
@@ -452,7 +453,7 @@ class NetworkManager:
                 return False
             
             # 2. Register new connection
-            self.register_connection(websocket, player_id, room_code)
+            self.register_connection(websocket, player_id, room_code, username)
             
             # 3. Get current game state
             game_state = redis_manager.get_game_state(room_code)
