@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hokm Game - Authentication</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .auth-section {
+            margin-bottom: 30px;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input[type="text"], input[type="password"], input[type="email"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-right: 10px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        .logout-btn {
+            background-color: #dc3545;
+        }
+        .logout-btn:hover {
+            background-color: #c82333;
+        }
+        .success {
+            color: green;
+            background-color: #d4edda;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .error {
+            color: red;
+            background-color: #f8d7da;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .user-info {
+            background-color: #e9ecef;
+            padding: 15px;
+            border-radius: 5px;
+            margin-top: 20px;
+        }
+        .hidden {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Hokm Card Game - Authentication</h1>
+        
+        <!-- Authentication Forms -->
+        <div id="auth-forms">
+            <!-- Login Form -->
+            <div class="auth-section">
+                <h2>Login</h2>
+                <form id="login-form">
+                    <div class="form-group">
+                        <label for="login-username">Username:</label>
+                        <input type="text" id="login-username" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="login-password">Password:</label>
+                        <input type="password" id="login-password" required>
+                    </div>
+                    <button type="submit">Login</button>
+                    <div id="login-result"></div>
+                </form>
+            </div>
+            
+            <!-- Registration Form -->
+            <div class="auth-section">
+                <h2>Register</h2>
+                <form id="register-form">
+                    <div class="form-group">
+                        <label for="register-username">Username:</label>
+                        <input type="text" id="register-username" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="register-password">Password:</label>
+                        <input type="password" id="register-password" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="register-email">Email (optional):</label>
+                        <input type="email" id="register-email">
+                    </div>
+                    <div class="form-group">
+                        <label for="register-display-name">Display Name (optional):</label>
+                        <input type="text" id="register-display-name">
+                    </div>
+                    <button type="submit">Register</button>
+                    <div id="register-result"></div>
+                </form>
+            </div>
+        </div>
+        
+        <!-- User Dashboard -->
+        <div id="user-dashboard" class="hidden">
+            <h2>Welcome to Hokm Game!</h2>
+            <div class="user-info">
+                <div id="user-details"></div>
+                <button onclick="logout()" class="logout-btn">Logout</button>
+                <button onclick="showProfile()">View Profile</button>
+                <button onclick="showStats()">View Stats</button>
+            </div>
+            
+            <div id="profile-section" class="auth-section hidden">
+                <h3>Profile</h3>
+                <div id="profile-details"></div>
+            </div>
+            
+            <div id="stats-section" class="auth-section hidden">
+                <h3>Statistics</h3>
+                <div id="stats-details"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        class AuthManager {
+            constructor() {
+                this.baseURL = 'http://localhost:5000/api/auth';
+                this.token = localStorage.getItem('token');
+                this.currentUser = null;
+                
+                // Load user from localStorage if available
+                const storedUser = localStorage.getItem('user');
+                if (storedUser) {
+                    this.currentUser = JSON.parse(storedUser);
+                }
+            }
+
+            async login(username, password) {
+                try {
+                    const response = await fetch(`${this.baseURL}/login`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ username, password })
+                    });
+
+                    const data = await response.json();
+
+                    if (data.success) {
+                        this.token = data.token;
+                        this.currentUser = {
+                            player_id: data.player_id,
+                            username: data.username,
+                            display_name: data.display_name,
+                            rating: data.rating,
+                            total_games: data.total_games,
+                            wins: data.wins,
+                            losses: data.losses,
+                            draws: data.draws,
+                            win_percentage: data.win_percentage
+                        };
+                        localStorage.setItem('token', this.token);
+                        localStorage.setItem('user', JSON.stringify(this.currentUser));
+                        return { success: true, user: this.currentUser };
+                    } else {
+                        return { success: false, message: data.message };
+                    }
+                } catch (error) {
+                    return { success: false, message: 'Login failed: ' + error.message };
+                }
+            }
+
+            async register(username, password, email = null, displayName = null) {
+                try {
+                    const response = await fetch(`${this.baseURL}/register`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ 
+                            username, 
+                            password, 
+                            email, 
+                            display_name: displayName 
+                        })
+                    });
+
+                    const data = await response.json();
+
+                    if (data.success) {
+                        this.token = data.token;
+                        this.currentUser = {
+                            player_id: data.player_id,
+                            username: data.username,
+                            display_name: data.display_name,
+                            rating: data.rating
+                        };
+                        localStorage.setItem('token', this.token);
+                        localStorage.setItem('user', JSON.stringify(this.currentUser));
+                        return { success: true, user: this.currentUser };
+                    } else {
+                        return { success: false, message: data.message };
+                    }
+                } catch (error) {
+                    return { success: false, message: 'Registration failed: ' + error.message };
+                }
+            }
+
+            async verifyToken() {
+                if (!this.token) return false;
+
+                try {
+                    const response = await fetch(`${this.baseURL}/verify`, {
+                        headers: {
+                            'Authorization': `Bearer ${this.token}`
+                        }
+                    });
+
+                    const data = await response.json();
+
+                    if (data.success) {
+                        this.currentUser = data.user;
+                        localStorage.setItem('user', JSON.stringify(this.currentUser));
+                        return true;
+                    } else {
+                        this.logout();
+                        return false;
+                    }
+                } catch (error) {
+                    this.logout();
+                    return false;
+                }
+            }
+
+            async getProfile() {
+                if (!this.token) return null;
+
+                try {
+                    const response = await fetch(`${this.baseURL}/profile`, {
+                        headers: {
+                            'Authorization': `Bearer ${this.token}`
+                        }
+                    });
+
+                    const data = await response.json();
+                    return data.success ? data.player : null;
+                } catch (error) {
+                    return null;
+                }
+            }
+
+            async getStats() {
+                if (!this.token) return null;
+
+                try {
+                    const response = await fetch(`${this.baseURL}/stats`, {
+                        headers: {
+                            'Authorization': `Bearer ${this.token}`
+                        }
+                    });
+
+                    const data = await response.json();
+                    return data.success ? data.stats : null;
+                } catch (error) {
+                    return null;
+                }
+            }
+
+            logout() {
+                this.token = null;
+                this.currentUser = null;
+                localStorage.removeItem('token');
+                localStorage.removeItem('user');
+            }
+
+            isAuthenticated() {
+                return this.token !== null && this.currentUser !== null;
+            }
+
+            getCurrentUser() {
+                return this.currentUser;
+            }
+        }
+
+        // Initialize auth manager
+        const authManager = new AuthManager();
+
+        // DOM elements
+        const authForms = document.getElementById('auth-forms');
+        const userDashboard = document.getElementById('user-dashboard');
+        const loginForm = document.getElementById('login-form');
+        const registerForm = document.getElementById('register-form');
+
+        // Event listeners
+        loginForm.addEventListener('submit', handleLogin);
+        registerForm.addEventListener('submit', handleRegister);
+
+        // Initialize app
+        document.addEventListener('DOMContentLoaded', initializeApp);
+
+        async function initializeApp() {
+            // Check if user is already authenticated
+            if (authManager.isAuthenticated()) {
+                const isValid = await authManager.verifyToken();
+                if (isValid) {
+                    showUserDashboard();
+                    return;
+                }
+            }
+
+            // Show authentication forms
+            showAuthForms();
+        }
+
+        async function handleLogin(e) {
+            e.preventDefault();
+            
+            const username = document.getElementById('login-username').value;
+            const password = document.getElementById('login-password').value;
+            const resultDiv = document.getElementById('login-result');
+
+            if (!username || !password) {
+                showResult(resultDiv, 'Please enter both username and password', false);
+                return;
+            }
+
+            const result = await authManager.login(username, password);
+            
+            if (result.success) {
+                showResult(resultDiv, `Login successful! Welcome, ${result.user.username}!`, true);
+                setTimeout(() => {
+                    showUserDashboard();
+                }, 1000);
+            } else {
+                showResult(resultDiv, result.message, false);
+            }
+        }
+
+        async function handleRegister(e) {
+            e.preventDefault();
+            
+            const username = document.getElementById('register-username').value;
+            const password = document.getElementById('register-password').value;
+            const email = document.getElementById('register-email').value;
+            const displayName = document.getElementById('register-display-name').value;
+            const resultDiv = document.getElementById('register-result');
+
+            if (!username || !password) {
+                showResult(resultDiv, 'Please enter both username and password', false);
+                return;
+            }
+
+            const result = await authManager.register(username, password, email, displayName);
+            
+            if (result.success) {
+                showResult(resultDiv, `Registration successful! Welcome, ${result.user.username}!`, true);
+                setTimeout(() => {
+                    showUserDashboard();
+                }, 1000);
+            } else {
+                showResult(resultDiv, result.message, false);
+            }
+        }
+
+        function showAuthForms() {
+            authForms.classList.remove('hidden');
+            userDashboard.classList.add('hidden');
+            
+            // Clear forms
+            document.getElementById('login-form').reset();
+            document.getElementById('register-form').reset();
+            document.getElementById('login-result').innerHTML = '';
+            document.getElementById('register-result').innerHTML = '';
+        }
+
+        function showUserDashboard() {
+            authForms.classList.add('hidden');
+            userDashboard.classList.remove('hidden');
+            
+            const user = authManager.getCurrentUser();
+            const userDetails = document.getElementById('user-details');
+            
+            userDetails.innerHTML = `
+                <h3>Player Information</h3>
+                <p><strong>Username:</strong> ${user.username}</p>
+                <p><strong>Display Name:</strong> ${user.display_name || 'Not set'}</p>
+                <p><strong>Player ID:</strong> ${user.player_id}</p>
+                <p><strong>Rating:</strong> ${user.rating || 1000}</p>
+                <p><strong>Total Games:</strong> ${user.total_games || 0}</p>
+                <p><strong>Wins:</strong> ${user.wins || 0}</p>
+                <p><strong>Losses:</strong> ${user.losses || 0}</p>
+                <p><strong>Draws:</strong> ${user.draws || 0}</p>
+                <p><strong>Win Percentage:</strong> ${user.win_percentage || 0}%</p>
+            `;
+        }
+
+        async function showProfile() {
+            const profile = await authManager.getProfile();
+            const profileSection = document.getElementById('profile-section');
+            const profileDetails = document.getElementById('profile-details');
+            
+            if (profile) {
+                profileDetails.innerHTML = `
+                    <p><strong>Username:</strong> ${profile.username}</p>
+                    <p><strong>Display Name:</strong> ${profile.display_name || 'Not set'}</p>
+                    <p><strong>Email:</strong> ${profile.email || 'Not set'}</p>
+                    <p><strong>Country:</strong> ${profile.country_code || 'Not set'}</p>
+                    <p><strong>Timezone:</strong> ${profile.timezone || 'Not set'}</p>
+                    <p><strong>Account Status:</strong> ${profile.account_status}</p>
+                    <p><strong>Email Verified:</strong> ${profile.email_verified ? 'Yes' : 'No'}</p>
+                    <p><strong>Created:</strong> ${profile.created_at ? new Date(profile.created_at).toLocaleDateString() : 'Unknown'}</p>
+                    <p><strong>Last Login:</strong> ${profile.last_login ? new Date(profile.last_login).toLocaleDateString() : 'Unknown'}</p>
+                `;
+                profileSection.classList.remove('hidden');
+            } else {
+                profileDetails.innerHTML = '<p>Failed to load profile information.</p>';
+            }
+        }
+
+        async function showStats() {
+            const stats = await authManager.getStats();
+            const statsSection = document.getElementById('stats-section');
+            const statsDetails = document.getElementById('stats-details');
+            
+            if (stats) {
+                statsDetails.innerHTML = `
+                    <p><strong>Rating:</strong> ${stats.rating}</p>
+                    <p><strong>Total Games:</strong> ${stats.total_games}</p>
+                    <p><strong>Wins:</strong> ${stats.wins}</p>
+                    <p><strong>Losses:</strong> ${stats.losses}</p>
+                    <p><strong>Draws:</strong> ${stats.draws}</p>
+                    <p><strong>Total Points:</strong> ${stats.total_points}</p>
+                    <p><strong>Win Percentage:</strong> ${stats.win_percentage}%</p>
+                    <p><strong>Account Status:</strong> ${stats.account_status}</p>
+                    <p><strong>Active:</strong> ${stats.is_active ? 'Yes' : 'No'}</p>
+                `;
+                statsSection.classList.remove('hidden');
+            } else {
+                statsDetails.innerHTML = '<p>Failed to load statistics.</p>';
+            }
+        }
+
+        function logout() {
+            authManager.logout();
+            showAuthForms();
+            
+            // Hide profile and stats sections
+            document.getElementById('profile-section').classList.add('hidden');
+            document.getElementById('stats-section').classList.add('hidden');
+        }
+
+        function showResult(element, message, isSuccess) {
+            element.innerHTML = `<div class="${isSuccess ? 'success' : 'error'}">${message}</div>`;
+        }
+    </script>
+</body>
+</html>

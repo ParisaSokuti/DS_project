@@ -11,6 +11,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from game_states import GameState
+from client_auth_manager import ClientAuthManager
 
 
 SERVER_URI = "ws://localhost:8765"
@@ -162,16 +163,11 @@ async def main():
             print(f"Failed to clear room: {e}")
             return
     
-    # Regular client initialization
-    player_base = "player"
-    username = player_base  # Server will assign the number
+    # Initialize authentication manager
+    auth_manager = ClientAuthManager()
     
-    if not username:
-        print("Username cannot be empty")
-        return
-        
     # Initialize game state variables
-    current_state = GameState.WAITING_FOR_PLAYERS
+    current_state = GameState.AUTHENTICATION  # Start with authentication phase
     your_turn = False
     hand = []
     hokm = None
@@ -183,7 +179,6 @@ async def main():
     room_code = "9999"  # Default room code
     
     print(f"\nConnecting to server...")
-    print(f"📁 Session file: {SESSION_FILE}")
     
     summary_info = {}
     hand_info = {}
@@ -215,8 +210,32 @@ async def main():
         print("📝 No previous session found, starting fresh")
     
     async with websockets.connect(SERVER_URI) as ws:
+        # Phase 0: Authentication
+        if current_state == GameState.AUTHENTICATION:
+            print("\n🔐 Phase 0: Authentication")
+            authenticated = await auth_manager.authenticate_with_server(ws)
+            if not authenticated:
+                print("❌ Authentication failed. Exiting.")
+                return
+            
+            # Get player information from authentication
+            player_info = auth_manager.get_player_info()
+            player_id = player_info['player_id']
+            username = player_info['username']
+            you = username
+            
+            # Display player info
+            auth_manager.display_player_info()
+            
+            # Update session file with player ID for reconnection
+            with open(SESSION_FILE, 'w') as f:
+                f.write(player_id)
+            
+            current_state = GameState.WAITING_FOR_PLAYERS
+            print(f"\n🎮 Proceeding to game as {username}")
+        
         # Try to reconnect if we have a session, otherwise join as new player
-        if session_player_id:
+        if session_player_id and current_state != GameState.AUTHENTICATION:
             await ws.send(json.dumps({
                 "type": "reconnect",
                 "player_id": session_player_id,
@@ -225,7 +244,6 @@ async def main():
         else:
             await ws.send(json.dumps({
                 "type": "join",
-                "username": player_base,
                 "room_code": "9999"
             }))
         
@@ -257,10 +275,29 @@ async def main():
                     
                 msg_type = data.get('type')
                 
+                # Handle authentication responses
+                if msg_type == 'auth_response':
+                    if data.get('success'):
+                        print(f"✅ {data.get('message', 'Authentication successful')}")
+                        # Authentication is handled by auth_manager, continue with game
+                    else:
+                        print(f"❌ Authentication failed: {data.get('message')}")
+                        return
+                    continue
+                
                 # Handle errors first
                 if msg_type == 'error':
                     error_msg = data.get('message', 'Unknown error')
                     print(f"\n❌ Error: {error_msg}")
+                    
+                    # Handle authentication required error
+                    if "authentication required" in error_msg.lower():
+                        print("🔐 Re-authenticating...")
+                        authenticated = await auth_manager.authenticate_with_server(ws)
+                        if not authenticated:
+                            print("❌ Re-authentication failed. Exiting.")
+                            return
+                        continue
                     
                     # If reconnection failed, try joining as new player
                     if session_player_id and ("reconnect" in error_msg.lower() or "session" in error_msg.lower()):
@@ -275,7 +312,6 @@ async def main():
                         # Try joining as new player
                         await ws.send(json.dumps({
                             "type": "join",
-                            "username": player_base,
                             "room_code": "9999"
                         }))
                         continue

@@ -19,6 +19,7 @@ from game_board import GameBoard
 from game_states import GameState
 from redis_manager_resilient import ResilientRedisManager as RedisManager
 from circuit_breaker_monitor import CircuitBreakerMonitor
+from game_auth_manager import GameAuthManager
 
 # Constants
 ROOM_SIZE = 4    # Single game storage system
@@ -28,6 +29,7 @@ class GameServer:
         self.redis_manager = RedisManager()
         self.circuit_breaker_monitor = CircuitBreakerMonitor(self.redis_manager)
         self.network_manager = NetworkManager()
+        self.auth_manager = GameAuthManager()  # Add authentication manager
         self.active_games = {}  # Maps room_code -> GameBoard for active games only
         self.load_active_games_from_redis()  # Load active games on startup
 
@@ -161,24 +163,35 @@ class GameServer:
                 await self.network_manager.notify_error(websocket, "Room is full")
                 return None
 
-            # Create new player with unique ID and name
-            player_id = str(uuid.uuid4())
+            # Get authenticated player info
+            player_info = self.auth_manager.get_authenticated_player(websocket)
+            if not player_info:
+                await self.network_manager.notify_error(websocket, "Authentication required")
+                return None
+            
+            # Use authenticated player information
+            player_id = player_info['player_id']
+            username = player_info['username']
+            display_name = player_info['display_name']
+            
             # Count current players in this room to assign correct player number
             current_room_count = 0
             for ws, metadata in self.network_manager.connection_metadata.items():
                 if metadata.get('room_code') == room_code:
                     current_room_count += 1
             player_number = current_room_count + 1  # This player will be the next number
-            username = f"Player {player_number}"
 
             # Save session data to Redis
             session_data = {
                 'username': username,
+                'display_name': display_name,
+                'player_id': player_id,
                 'room_code': room_code,
                 'connected_at': str(int(time.time())),
                 'expires_at': str(int(time.time()) + 3600),
                 'player_number': player_number,
-                'connection_status': 'active'
+                'connection_status': 'active',
+                'rating': player_info.get('rating', 1000)
             }
             try:
                 executor = concurrent.futures.ThreadPoolExecutor()
@@ -301,6 +314,11 @@ class GameServer:
                     return
             except Exception as e:
                 print(f"[ERROR] Could not get room players: {e}")
+                return
+            
+            # Ensure we have exactly 4 players
+            if len(players) != 4:
+                print(f"[ERROR] Invalid player count: {len(players)}, expected 4 players")
                 return
             
             # Create new game instance
@@ -494,6 +512,9 @@ class GameServer:
     async def handle_connection_closed(self, websocket):
         """Handle WebSocket connection closure"""
         try:
+            # Clean up authentication
+            self.auth_manager.disconnect_player(websocket)
+            
             # Check if websocket exists in connection metadata
             if websocket not in self.network_manager.connection_metadata:
                 print(f"[LOG] Connection closed but websocket not in metadata: {websocket.remote_address}")
@@ -581,6 +602,17 @@ class GameServer:
             if not msg_type:
                 await self.network_manager.notify_error(websocket, "Malformed message: missing 'type' field.")
                 return
+            
+            # Handle authentication messages first (Phase 0)
+            if msg_type in ['auth_login', 'auth_register', 'auth_token']:
+                await self.handle_authentication(websocket, message)
+                return
+            
+            # Check authentication for all other messages
+            if not self.auth_manager.is_authenticated(websocket):
+                await self.network_manager.notify_error(websocket, "Authentication required. Please authenticate first.")
+                return
+            
             if msg_type == 'join':
                 print(f"[DEBUG] Handling join message")
                 # Validate required fields for join
@@ -629,6 +661,122 @@ class GameServer:
                 await self.network_manager.notify_error(websocket, f"Internal server error: {str(e)}")
             except Exception as notify_err:
                 print(f"[ERROR] Failed to notify user of message error: {notify_err}")
+
+    async def handle_authentication(self, websocket, message):
+        """Handle authentication messages (Phase 0)"""
+        print(f"[DEBUG] Handling authentication message: {message.get('type')}")
+        
+        try:
+            msg_type = message.get('type')
+            
+            if msg_type == 'auth_login':
+                # Handle username/password login
+                username = message.get('username')
+                password = message.get('password')
+                
+                if not username or not password:
+                    await websocket.send(json.dumps({
+                        'type': 'auth_response',
+                        'success': False,
+                        'message': 'Username and password are required'
+                    }))
+                    return
+                
+                auth_data = {
+                    'type': 'login',
+                    'username': username,
+                    'password': password
+                }
+                
+                result = await self.auth_manager.authenticate_player(websocket, auth_data)
+                
+                response = {
+                    'type': 'auth_response',
+                    'success': result['success'],
+                    'message': result['message']
+                }
+                
+                if result['success']:
+                    response['player_info'] = result['player_info']
+                    print(f"[LOG] Player authenticated: {username} (ID: {result['player_info']['player_id'][:8]}...)")
+                
+                await websocket.send(json.dumps(response))
+                
+            elif msg_type == 'auth_register':
+                # Handle user registration
+                username = message.get('username')
+                password = message.get('password')
+                email = message.get('email')
+                display_name = message.get('display_name')
+                
+                if not username or not password:
+                    await websocket.send(json.dumps({
+                        'type': 'auth_response',
+                        'success': False,
+                        'message': 'Username and password are required'
+                    }))
+                    return
+                
+                auth_data = {
+                    'type': 'register',
+                    'username': username,
+                    'password': password,
+                    'email': email,
+                    'display_name': display_name
+                }
+                
+                result = await self.auth_manager.authenticate_player(websocket, auth_data)
+                
+                response = {
+                    'type': 'auth_response',
+                    'success': result['success'],
+                    'message': result['message']
+                }
+                
+                if result['success']:
+                    response['player_info'] = result['player_info']
+                    print(f"[LOG] Player registered and authenticated: {username} (ID: {result['player_info']['player_id'][:8]}...)")
+                
+                await websocket.send(json.dumps(response))
+                
+            elif msg_type == 'auth_token':
+                # Handle JWT token authentication
+                token = message.get('token')
+                
+                if not token:
+                    await websocket.send(json.dumps({
+                        'type': 'auth_response',
+                        'success': False,
+                        'message': 'Token is required'
+                    }))
+                    return
+                
+                auth_data = {
+                    'type': 'token',
+                    'token': token
+                }
+                
+                result = await self.auth_manager.authenticate_player(websocket, auth_data)
+                
+                response = {
+                    'type': 'auth_response',
+                    'success': result['success'],
+                    'message': result['message']
+                }
+                
+                if result['success']:
+                    response['player_info'] = result['player_info']
+                    print(f"[LOG] Player authenticated via token: {result['player_info']['username']} (ID: {result['player_info']['player_id'][:8]}...)")
+                
+                await websocket.send(json.dumps(response))
+                
+        except Exception as e:
+            print(f"[ERROR] Authentication error: {str(e)}")
+            await websocket.send(json.dumps({
+                'type': 'auth_response',
+                'success': False,
+                'message': f'Authentication failed: {str(e)}'
+            }))
 
     async def handle_hokm_selection(self, websocket, message):
         """Handle hokm selection by the Hakem, save state, broadcast, and deal remaining cards."""

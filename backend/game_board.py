@@ -48,6 +48,12 @@ class GameBoard:
         print("=== Team Assignment Process ===")
         print(f"Players: {self.players}")
         
+        # Validate that we have exactly 4 players
+        if len(self.players) != 4:
+            error_msg = f"Cannot assign teams: Expected 4 players, got {len(self.players)}"
+            print(f"[ERROR] {error_msg}")
+            return {"error": error_msg}
+        
         # Step 1: Choose first player for Team 1
         first_team1_player = random.choice(self.players)
         print(f"First Team 1 player selected: {first_team1_player}")
