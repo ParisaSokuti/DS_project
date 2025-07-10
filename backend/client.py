@@ -6,6 +6,10 @@ import sys
 import random
 import os
 import time
+import queue
+import hashlib
+import socket
+import getpass
 
 # Add current directory to Python path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -18,9 +22,6 @@ SERVER_URI = "ws://localhost:8765"
 
 def get_terminal_session_id():
     """Generate a persistent session ID for the current terminal"""
-    import hashlib
-    import socket
-    import getpass
     
     # Try to get terminal-specific identifiers
     terminal_id = os.environ.get('TERM_SESSION_ID', '')  # macOS Terminal
@@ -97,7 +98,7 @@ def sort_hand(hand, hokm):
         hand,
         key=lambda card: (
             suits_order.index(parse(card)[0]) if parse(card)[0] in suits_order else 99,
-            -rank_values.get(parse(card)[0].upper() if parse(card)[0].upper() in rank_values else parse(card)[1], 0)
+            -rank_values.get(parse(card)[1], 0)  # Fixed: use rank (parse(card)[1]) instead of suit
         )
     )
 
@@ -255,19 +256,19 @@ async def main():
         username = player_info['username']
         you = username
         
+        print(f"🔑 Authenticated as: {username}")
+        print(f"🆔 Player ID: {player_id[:12]}...")
+        
         # Display player info
         auth_manager.display_player_info()
-        
-        # Update session file with player ID for reconnection
-        with open(SESSION_FILE, 'w') as f:
-            f.write(player_id)
         
         current_state = GameState.WAITING_FOR_PLAYERS
         print(f"\n🎮 Proceeding to game as {username}")
         
         # Try to reconnect if we have a session and the authenticated player matches
         if session_player_id and session_player_id == player_id:
-            print(f"🔄 Attempting to reconnect to previous game...")
+            print(f"✅ Session matches current player - attempting reconnection")
+            print(f"� Connecting to previous game session...")
             await ws.send(json.dumps({
                 "type": "reconnect",
                 "player_id": session_player_id,
@@ -276,9 +277,12 @@ async def main():
             
             # Wait for response with timeout
             try:
-                response = await asyncio.wait_for(ws.recv(), timeout=10.0)
+                print(f"🕐 Waiting for reconnection response (30s timeout)...")
+                response = await asyncio.wait_for(ws.recv(), timeout=30.0)  # Increased from 10.0
+                print(f"📥 Received response: {response[:100]}..." if len(response) > 100 else f"📥 Received response: {response}")
                 data = json.loads(response)
                 msg_type = data.get('type')
+                print(f"🔍 Message type: {msg_type}")
                 
                 if msg_type == 'reconnect_success':
                     print(f"✅ Successfully reconnected!")
@@ -296,7 +300,6 @@ async def main():
                     print(f"🤔 Unexpected response during reconnection: {msg_type}")
                     # Continue processing the message normally
                     # Put the message back for processing
-                    import queue
                     message_queue = queue.Queue()
                     message_queue.put(response)
                     
@@ -314,7 +317,24 @@ async def main():
                     
         else:
             if session_player_id and session_player_id != player_id:
-                print(f"⚠️  Session player ID mismatch. Starting fresh game.")
+                print(f"⚠️  Session player ID mismatch!")
+                print(f"   Previous session: {session_player_id[:12]}...")
+                print(f"   Current player:   {player_id[:12]}...")
+                print(f"   You may have logged in with a different username.")
+                print(f"   Starting fresh game session.")
+                
+                # Clear the old session file since it doesn't match
+                try:
+                    os.remove(SESSION_FILE)
+                    print("   🗑️  Old session file cleared")
+                except:
+                    pass
+                    
+            elif session_player_id:
+                print(f"🔍 Found session but no match - starting fresh")
+            else:
+                print(f"📝 No previous session - starting fresh")
+                
             await ws.send(json.dumps({
                 "type": "join",
                 "room_code": "9999"
@@ -571,6 +591,7 @@ async def main():
                         try:
                             with open(SESSION_FILE, 'w') as f:
                                 f.write(player_id)
+                            print(f"💾 Session saved for future reconnection")
                             
                             if reconnected:
                                 print(f"🔄 {data.get('message', 'Reconnected successfully')}")
@@ -595,6 +616,7 @@ async def main():
                             with open(SESSION_FILE, 'w') as f:
                                 f.write(player_id)
                             print(f"🔄 Successfully reconnected as {username}")
+                            print(f"💾 Session confirmed and saved")
                             
                             # Restore game state if available
                             if game_state_data:
@@ -1049,34 +1071,6 @@ async def main():
                     username = data.get('username')
                     active_players = data.get('active_players', 0)
                     print(f"\n🔄 Player reconnected: {username} ({active_players} active players)")
-                
-                elif msg_type == 'reconnect_success':
-                    # Restore game state from reconnect data
-                    hand = data.get('hand', [])
-                    is_hakem = data.get('is_hakem', False)
-                    hakem = data.get('hakem')
-                    hokm = data.get('hokm')
-                    phase = data.get('phase')
-                    your_turn = data.get('your_turn', False)
-                    
-                    # Update game state
-                    current_state = GameState(phase) if phase else current_state
-                    
-                    print("\n=== Session Restored ===")
-                    print(f"Current phase: {phase}")
-                    print(f"Hakem: {hakem}" + (" (You!)" if is_hakem else ""))
-                    if hokm:
-                        print(f"Hokm: {hokm.upper()}")
-                    
-                    # Show restored hand
-                    if hand:
-                        print("\nYour hand:")
-                        sorted_hand = sort_hand(hand, hokm) if hokm else hand
-                        for idx, card in enumerate(sorted_hand, 1):
-                            print(f"{idx}. {card}")
-                        
-                    if your_turn:
-                        print("\n⭐ It's your turn!")
 
                 # State-specific validations
                 if msg_type == 'play_card' and current_state != GameState.GAMEPLAY:

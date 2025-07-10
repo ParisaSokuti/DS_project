@@ -467,27 +467,48 @@ class NetworkManager:
             print(f"[DEBUG] Player {username} reconnection allowed - live_connection: {live_connection is not None}, status: {player_in_room.get('connection_status')}")
             
             # 2. Register new connection
+            print(f"[DEBUG] Step 3: Registering connection for {username}...")
             self.register_connection(websocket, player_id, room_code, username)
+            print(f"[DEBUG] Connection registered successfully")
             
             # 3. Get current game state
-            game_state = redis_manager.get_game_state(room_code)
-            if not game_state:
+            print(f"[DEBUG] Step 4: Getting game state for room {room_code}...")
+            try:
+                print(f"[DEBUG] Step 4a: Calling get_game_state directly...")
+                game_state = redis_manager.get_game_state(room_code)
+                print(f"[DEBUG] Step 4b: Game state retrieval completed")
+                
+            except Exception as e:
+                print(f"[ERROR] Exception during game state retrieval: {e}")
+                print(f"[ERROR] Exception type: {type(e).__name__}")
+                import traceback
+                traceback.print_exc()
+                await self.notify_error(websocket, f"Reconnection failed: Game state error - {str(e)}")
+                return False
+                
+            print(f"[DEBUG] Game state retrieved: {bool(game_state)}")
+            if game_state:
+                print(f"[DEBUG] Game state has {len(game_state)} keys: {list(game_state.keys())}")
+            else:
+                print(f"[DEBUG] No game state found, using empty state")
                 game_state = {}
             
             # 4. Send reconnection success with full state
+            print(f"[DEBUG] Step 5: Preparing reconnection success message...")
+            
             # Handle JSON parsing safely - data might already be parsed from Redis
             teams_data = game_state.get('teams', '{}')
             if isinstance(teams_data, str):
                 teams = json.loads(teams_data)
             else:
                 teams = teams_data
+            print(f"[DEBUG] Teams data processed: {teams}")
                 
             hand_data = game_state.get(f'hand_{username}', '[]')
             if isinstance(hand_data, str):
                 hand = json.loads(hand_data)
             else:
                 hand = hand_data
-                
             print(f"[DEBUG] Reconnection: Player {username} hand has {len(hand)} cards from Redis")
                 
             tricks_data = game_state.get('tricks', '{}')
@@ -495,6 +516,7 @@ class NetworkManager:
                 tricks = json.loads(tricks_data)
             else:
                 tricks = tricks_data
+            print(f"[DEBUG] Tricks data processed: {bool(tricks)}")
                 
             restored_state = {
                 'username': username,
@@ -513,12 +535,21 @@ class NetworkManager:
                 }
             }
             
-            await self.send_message(websocket, 'reconnect_success', restored_state)
+            print(f"[DEBUG] Step 6: Sending reconnect_success to {username}...")
+            try:
+                success = await self.send_message(websocket, 'reconnect_success', restored_state)
+                print(f"[DEBUG] Message send result: {success}")
+                if not success:
+                    print(f"[ERROR] Failed to send reconnect_success message")
+                    return False
+            except Exception as e:
+                print(f"[ERROR] Exception while sending reconnect_success: {e}")
+                return False
             
             print(f"[LOG] Player {username} reconnected to room {room_code}")
             print(f"[DEBUG] Active connections: {len(self.live_connections)}")
             
-            # 5. Check if reconnected player is hakem and needs to choose hokm
+            # 7. Check if reconnected player is hakem and needs to choose hokm
             current_phase = game_state.get('phase', game_state.get('game_phase', 'waiting'))
             current_hakem = game_state.get('hakem')
             current_hokm = game_state.get('hokm', '')
@@ -567,6 +598,17 @@ class NetworkManager:
             )
             
             return True
+            
+        except Exception as e:
+            print(f"[ERROR] Exception in handle_player_reconnected for {player_id[:8]}...: {e}")
+            print(f"[ERROR] Exception type: {type(e).__name__}")
+            import traceback
+            traceback.print_exc()
+            try:
+                await self.notify_error(websocket, f"Reconnection failed due to server error: {str(e)}")
+            except:
+                print(f"[ERROR] Could not send error notification to client")
+            return False
             
         except Exception as e:
             print(f"[ERROR] Failed to handle player reconnection: {str(e)}")

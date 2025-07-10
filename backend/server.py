@@ -300,8 +300,44 @@ class GameServer:
                     loop.run_in_executor(executor, self.redis_manager.get_room_players, room_code),
                     timeout=2.0
                 )
-                players = [p['username'] for p in room_players_data]
-                print(f"[DEBUG] Got players from Redis: {players}")
+                
+                # Filter for only currently connected players
+                connected_players = []
+                active_player_ids = []
+                for player_data in room_players_data:
+                    player_id = player_data.get('player_id')
+                    username = player_data.get('username')
+                    
+                    # Check if player has an active connection
+                    has_active_connection = False
+                    for ws, metadata in self.network_manager.connection_metadata.items():
+                        if (metadata.get('player_id') == player_id and 
+                            metadata.get('room_code') == room_code):
+                            has_active_connection = True
+                            break
+                    
+                    if has_active_connection:
+                        connected_players.append(username)
+                        active_player_ids.append(player_id)
+                        print(f"[DEBUG] Player {username} is connected and active")
+                    else:
+                        print(f"[DEBUG] Player {username} is not connected, skipping")
+                
+                # Clean up disconnected players from Redis
+                await asyncio.wait_for(
+                    loop.run_in_executor(executor, self.redis_manager.cleanup_disconnected_players, room_code, active_player_ids),
+                    timeout=2.0
+                )
+                
+                players = connected_players
+                print(f"[DEBUG] Got {len(players)} connected players from Redis: {players}")
+                
+                # Ensure we have exactly 4 connected players
+                if len(players) != 4:
+                    print(f"[ERROR] Invalid connected player count: {len(players)}, expected 4 players")
+                    print(f"[DEBUG] All players in Redis: {[p['username'] for p in room_players_data]}")
+                    print(f"[DEBUG] Connected players: {players}")
+                    return
             except asyncio.TimeoutError:
                 print(f"[DEBUG] Redis timeout when getting room players, using network manager fallback")
                 # Fallback: get players from network manager connections
@@ -318,11 +354,6 @@ class GameServer:
                     return
             except Exception as e:
                 print(f"[ERROR] Could not get room players: {e}")
-                return
-            
-            # Ensure we have exactly 4 players
-            if len(players) != 4:
-                print(f"[ERROR] Invalid player count: {len(players)}, expected 4 players")
                 return
             
             # Create new game instance

@@ -6,7 +6,15 @@ from typing import Dict, List, Optional, Any, Tuple
 
 class RedisManager:
     def __init__(self):
-        self.redis = redis.Redis(host='localhost', port=6379, db=0)
+        self.redis = redis.Redis(
+            host='localhost', 
+            port=6379, 
+            db=0,
+            socket_timeout=5.0,  # 5 second timeout for socket operations
+            socket_connect_timeout=3.0,  # 3 second timeout for connection
+            socket_keepalive=True,
+            socket_keepalive_options={}
+        )
         self.connection_timeout = 30  # Connection timeout in seconds
         self.heartbeat_interval = 10  # Heartbeat check interval
         self.metrics = {
@@ -134,30 +142,68 @@ class RedisManager:
 
     def get_game_state(self, room_code: str) -> dict:
         """Get game state with proper decoding"""
+        print(f"[DEBUG] get_game_state START for room {room_code}")
+        import time
+        import signal
+        start_time = time.time()
+        
+        # Add timeout handler
+        def timeout_handler(signum, frame):
+            raise TimeoutError("Redis operation timed out")
+        
         try:
             key = f"game:{room_code}:state"
-            raw_state = self.redis.hgetall(key)
+            print(f"[DEBUG] Step 1: About to call hgetall on key: {key}")
+            
+            # Set a manual timeout of 10 seconds
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(10)  # 10 second timeout
+            
+            try:
+                raw_state = self.redis.hgetall(key)
+                signal.alarm(0)  # Cancel the timeout
+                print(f"[DEBUG] Step 2: hgetall completed, raw_state type: {type(raw_state)}, items: {len(raw_state)}")
+            except TimeoutError:
+                signal.alarm(0)  # Cancel the timeout
+                print(f"[ERROR] Redis hgetall timed out after 10 seconds")
+                elapsed = time.time() - start_time
+                print(f"[DEBUG] get_game_state END (timeout, {elapsed:.2f}s)")
+                return {}
+            
             if not raw_state:
                 print(f"[WARNING] No state found for room {room_code}")
+                elapsed = time.time() - start_time
+                print(f"[DEBUG] get_game_state END (no state, {elapsed:.2f}s)")
                 return {}
                 
+            print(f"[DEBUG] Step 3: Decoding bytes to string...")
             # Decode bytes to string
             state = {k.decode(): v.decode() for k, v in raw_state.items()}
+            print(f"[DEBUG] Step 4: Decoded {len(state)} items")
             
+            print(f"[DEBUG] Step 5: Processing JSON values...")
             # Try to decode JSON values
             for k, v in list(state.items()):  # Use list to allow dict modification
                 try:
                     if k in ['teams', 'players', 'tricks', 'player_order'] or k.startswith('hand_'):
+                        print(f"[DEBUG] Step 5.{k}: Parsing JSON for {k}")
                         state[k] = json.loads(v)
+                        print(f"[DEBUG] Step 5.{k}: JSON parsing successful")
                 except json.JSONDecodeError as e:
                     print(f"[WARNING] Failed to decode JSON for key {k}: {str(e)}")
                     pass  # Keep as string if not valid JSON
                 except Exception as e:
                     print(f"[ERROR] Unexpected error processing key {k}: {str(e)}")
                     
+            elapsed = time.time() - start_time
+            print(f"[DEBUG] get_game_state END (success, {elapsed:.2f}s)")
             return state
         except Exception as e:
+            elapsed = time.time() - start_time
             print(f"[ERROR] Failed to get game state for room {room_code}: {str(e)}")
+            print(f"[DEBUG] get_game_state END (error, {elapsed:.2f}s)")
+            import traceback
+            traceback.print_exc()
             return {}
     
     def clear_room(self, room_code: str):

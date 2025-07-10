@@ -24,6 +24,10 @@ class ResilientRedisManager:
         self.connection_timeout = 30
         self.heartbeat_interval = 10
         
+        # Enable bypass mode for debugging
+        self.bypass_circuit_breaker = True
+        print(f"[DEBUG] Circuit breaker bypass mode: {self.bypass_circuit_breaker}")
+        
         # Circuit breaker configuration
         self.circuit_config = CircuitBreakerConfig(
             failure_threshold=3,        # Open circuit after 3 failures
@@ -299,15 +303,26 @@ class ResilientRedisManager:
     
     def get_game_state(self, room_code: str) -> dict:
         """Get game state with circuit breaker protection"""
+        print(f'[DEBUG] === get_game_state START for {room_code} ===')
+        import time
+        start_time = time.time()
+        
         def _redis_get():
+            print(f'[DEBUG] _redis_get START')
             key = f"game:{room_code}:state"
+            print(f'[DEBUG] About to call hgetall on key: {key}')
             raw_state = self.redis.hgetall(key)
+            print(f'[DEBUG] hgetall completed, items: {len(raw_state)}')
             if not raw_state:
+                print(f'[DEBUG] No raw state found, returning empty dict')
                 return {}
             
+            print(f'[DEBUG] Decoding bytes to string...')
             # Decode bytes to string
             state = {k.decode(): v.decode() for k, v in raw_state.items()}
+            print(f'[DEBUG] Decoded {len(state)} state items')
             
+            print(f'[DEBUG] Parsing JSON values...')
             # Decode JSON values
             for k, v in list(state.items()):
                 try:
@@ -316,14 +331,37 @@ class ResilientRedisManager:
                 except json.JSONDecodeError:
                     pass  # Keep as string if not valid JSON
             
+            print(f'[DEBUG] _redis_get completed successfully')
             return state
         
         cache_key = self._create_cache_key("game_state", room_code)
+        print(f'[DEBUG] Cache key: {cache_key}')
+        print(f'[DEBUG] Circuit breaker state: {self.circuits["read"].state}')
+        print(f'[DEBUG] About to call circuit breaker...')
+        
+        # Add emergency bypass for debugging
+        if hasattr(self, 'bypass_circuit_breaker') and self.bypass_circuit_breaker:
+            print(f'[DEBUG] BYPASS MODE: Calling _redis_get directly')
+            try:
+                direct_result = _redis_get()
+                elapsed = time.time() - start_time
+                print(f'[DEBUG] === get_game_state END (BYPASS, {elapsed:.2f}s) ===')
+                return direct_result
+            except Exception as e:
+                print(f'[ERROR] Direct Redis call failed: {e}')
+                elapsed = time.time() - start_time
+                print(f'[DEBUG] === get_game_state END (BYPASS FAILED, {elapsed:.2f}s) ===')
+                return {}
+        
         result = self.circuits['read'].call(
             _redis_get,
             fallback_func=lambda: self._fallback_get_game_state(room_code),
             cache_key=cache_key
         )
+        
+        elapsed = time.time() - start_time
+        print(f'[DEBUG] Circuit call completed: success={result.success}')
+        print(f'[DEBUG] === get_game_state END ({elapsed:.2f}s) ===')
         
         return result.value if result.success else {}
     
@@ -689,4 +727,48 @@ class ResilientRedisManager:
         except Exception as e:
             print(f"[ERROR] disconnect_player_session: {e}")
             self.logger.error(f"Error disconnecting session for {player_id[:8]}...: {e}")
+            return False
+    
+    def cleanup_disconnected_players(self, room_code: str, active_player_ids: List[str]) -> bool:
+        """Remove disconnected players from room"""
+        try:
+            key = f"room:{room_code}:players"
+            if not self.redis.exists(key):
+                return True
+            
+            # Get all players
+            players = self.redis.lrange(key, 0, -1)
+            kept_players = []
+            removed_count = 0
+            
+            for p in players:
+                try:
+                    player_data = json.loads(p.decode())
+                    player_id = player_data.get('player_id')
+                    username = player_data.get('username')
+                    
+                    # Keep player if they're in the active list
+                    if player_id in active_player_ids:
+                        kept_players.append(p)
+                        print(f"[DEBUG] Keeping active player {username}")
+                    else:
+                        removed_count += 1
+                        print(f"[DEBUG] Removing disconnected player {username}")
+                except Exception as e:
+                    print(f"[DEBUG] Error processing player data: {e}")
+                    continue
+            
+            if removed_count > 0:
+                # Clear the list and rebuild with only active players
+                self.redis.delete(key)
+                if kept_players:
+                    self.redis.rpush(key, *kept_players)
+                    self.redis.expire(key, 3600)
+                
+                print(f"[DEBUG] Cleaned up {removed_count} disconnected players from room {room_code}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to cleanup disconnected players: {e}")
             return False
