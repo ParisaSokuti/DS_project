@@ -44,7 +44,16 @@ async def main():
     server = MinimalGameServer()
     
     print("[DEBUG] Starting WebSocket server...")
-    async with websockets.serve(handle_connection, "0.0.0.0", 8765):
+    async with websockets.serve(
+        handle_connection, 
+        "0.0.0.0", 
+        8765,
+        ping_interval=60,      # Send ping every 60 seconds
+        ping_timeout=300,      # 5 minutes timeout for ping response
+        close_timeout=300,     # 5 minutes timeout for close handshake
+        max_size=1024*1024,    # 1MB max message size
+        max_queue=100          # Max queued messages
+    ):
         print("[LOG] WebSocket server is now listening on ws://0.0.0.0:8765")
         await asyncio.sleep(5)  # Run for 5 seconds
         print("[LOG] Test complete")

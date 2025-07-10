@@ -140,7 +140,16 @@ async def main():
     print("Starting Minimal Hokm WebSocket server on ws://0.0.0.0:8765")
     server = MinimalGameServer()
     
-    async with websockets.serve(server.handle_connection, "0.0.0.0", 8765):
+    async with websockets.serve(
+        server.handle_connection, 
+        "0.0.0.0", 
+        8765,
+        ping_interval=60,      # Send ping every 60 seconds
+        ping_timeout=300,      # 5 minutes timeout for ping response
+        close_timeout=300,     # 5 minutes timeout for close handshake
+        max_size=1024*1024,    # 1MB max message size
+        max_queue=100          # Max queued messages
+    ):
         print("INFO:server:server listening on 0.0.0.0:8765")
         await asyncio.Future()  # Run forever
 

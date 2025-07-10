@@ -46,11 +46,15 @@ class GameServer:
             print(f"[DEBUG] Room code: {room_code}")
             
             print(f"[DEBUG] About to check if room exists...")
-            # Validate room exists or can be created
-            # Use simplified room check to avoid Redis hanging
+            # Check if room exists properly
             try:
-                room_exists = False  # Always create new rooms for simplicity
-                print(f"[DEBUG] Simplified room check - assuming new room")
+                executor = concurrent.futures.ThreadPoolExecutor()
+                loop = asyncio.get_event_loop()
+                room_exists = await asyncio.wait_for(
+                    loop.run_in_executor(executor, self.redis_manager.room_exists, room_code),
+                    timeout=2.0
+                )
+                print(f"[DEBUG] Room exists check result: {room_exists}")
             except Exception as e:
                 print(f"[DEBUG] Room check failed: {e}, assuming new room")
                 room_exists = False
@@ -1962,8 +1966,18 @@ async def main():
     
     try:
         print("[DEBUG] Starting WebSocket server...")
-        server = await websockets.serve(handle_connection, "0.0.0.0", 8765)
+        server = await websockets.serve(
+            handle_connection, 
+            "0.0.0.0", 
+            8765,
+            ping_interval=60,      # Send ping every 60 seconds
+            ping_timeout=300,      # 5 minutes timeout for ping response
+            close_timeout=300,     # 5 minutes timeout for close handshake
+            max_size=1024*1024,    # 1MB max message size
+            max_queue=100          # Max queued messages
+        )
         print("[LOG] WebSocket server is now listening on ws://0.0.0.0:8765")
+        print("[LOG] WebSocket timeouts: ping_timeout=300s, close_timeout=300s")
         await server.wait_closed()  # Wait for server to be closed
     except Exception as e:
         print(f"[ERROR] Server error: {str(e)}")

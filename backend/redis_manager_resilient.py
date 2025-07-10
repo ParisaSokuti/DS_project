@@ -157,67 +157,89 @@ class ResilientRedisManager:
     
     def get_player_session(self, player_id: str) -> dict:
         """Get player session with circuit breaker protection"""
-        def _redis_get():
+        try:
+            print(f"[DEBUG] get_player_session: Direct Redis operation for {player_id[:8]}...")
             key = f"session:{player_id}"
             raw_data = self.redis.hgetall(key)
-            return {k.decode(): v.decode() for k, v in raw_data.items()}
-        
-        cache_key = self._create_cache_key("session", player_id)
-        result = self.circuits['read'].call(
-            _redis_get,
-            fallback_func=lambda: self._fallback_get_player_session(player_id),
-            cache_key=cache_key
-        )
-        
-        return result.value if result.success else {}
+            print(f"[DEBUG] get_player_session: Raw data retrieved: {len(raw_data)} items")
+            result = {k.decode(): v.decode() for k, v in raw_data.items()}
+            print(f"[DEBUG] get_player_session: Decoded result: {result}")
+            return result
+        except Exception as e:
+            print(f"[DEBUG] get_player_session: Redis error: {e}")
+            return self._fallback_get_player_session(player_id)
     
     def add_player_to_room(self, room_code: str, player_data: dict):
-        """Add player to room with circuit breaker protection"""
-        def _redis_add():
+        """Add player to room (append, don't overwrite)"""
+        try:
             key = f"room:{room_code}:players"
-            self.redis.rpush(key, json.dumps(player_data))
+            
+            # Check for duplicates more robustly
+            existing = self.redis.lrange(key, 0, -1)
+            existing_players = set()
+            
+            for player_bytes in existing:
+                try:
+                    player_info = json.loads(player_bytes.decode())
+                    # Check both username and player_id for duplicates
+                    if 'username' in player_info:
+                        existing_players.add(player_info['username'])
+                    if 'player_id' in player_info:
+                        existing_players.add(player_info['player_id'])
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+            
+            # Check if this player is already in the room
+            new_username = player_data.get('username')
+            new_player_id = player_data.get('player_id')
+            
+            if new_username not in existing_players and new_player_id not in existing_players:
+                self.redis.rpush(key, json.dumps(player_data))
+                print(f"[DEBUG] add_player_to_room: Added player {new_username} to room {room_code}")
+            else:
+                print(f"[DEBUG] add_player_to_room: Player {new_username} already exists in room {room_code}, skipping")
+                
             self.redis.expire(key, 3600)
             return True
-        
-        def _fallback_add():
+            
+        except Exception as e:
+            print(f"[ERROR] add_player_to_room: {e}")
+            # Fallback logic
             if room_code not in self.fallback_cache['room_players']:
                 self.fallback_cache['room_players'][room_code] = []
-            self.fallback_cache['room_players'][room_code].append(player_data)
-            self.logger.warning(f"Using fallback storage for adding player to room {room_code}")
+            
+            # Check fallback duplicates too
+            existing_usernames = {p.get('username') for p in self.fallback_cache['room_players'][room_code]}
+            if player_data.get('username') not in existing_usernames:
+                self.fallback_cache['room_players'][room_code].append(player_data)
             return True
-        
-        result = self.circuits['write'].call(
-            _redis_add,
-            fallback_func=_fallback_add
-        )
-        
-        if result.success:
-            # Update fallback cache
-            if room_code not in self.fallback_cache['room_players']:
-                self.fallback_cache['room_players'][room_code] = []
-            self.fallback_cache['room_players'][room_code].append(player_data)
-        
-        if not result.success:
-            self.logger.error(f"Failed to add player to room {room_code}: {result.error}")
     
     def get_room_players(self, room_code: str) -> List[dict]:
         """Get room players with circuit breaker protection"""
-        def _redis_get():
+        try:
+            print(f"[DEBUG] get_room_players: Getting players for room {room_code}...")
             key = f"room:{room_code}:players"
             if not self.redis.exists(key):
+                print(f"[DEBUG] get_room_players: Room {room_code} players list does not exist")
                 return []
             
             players = self.redis.lrange(key, 0, -1)
-            return [json.loads(p.decode()) for p in players]
-        
-        cache_key = self._create_cache_key("room_players", room_code)
-        result = self.circuits['read'].call(
-            _redis_get,
-            fallback_func=lambda: self._fallback_get_room_players(room_code),
-            cache_key=cache_key
-        )
-        
-        return result.value if result.success else []
+            result = []
+            for p in players:
+                try:
+                    player_data = json.loads(p.decode())
+                    # Filter out placeholder entries
+                    if not player_data.get('placeholder'):
+                        result.append(player_data)
+                except Exception as e:
+                    print(f"[DEBUG] get_room_players: Error decoding player data: {e}")
+                    continue
+            
+            print(f"[DEBUG] get_room_players: Found {len(result)} valid players in room {room_code}")
+            return result
+        except Exception as e:
+            print(f"[DEBUG] get_room_players: Redis error: {e}")
+            return self._fallback_get_room_players(room_code)
     
     def save_game_state(self, room_code: str, game_state: dict) -> bool:
         """Save game state with circuit breaker protection"""
@@ -307,16 +329,21 @@ class ResilientRedisManager:
     
     def room_exists(self, room_code: str) -> bool:
         """Check if room exists with circuit breaker protection"""
-        def _redis_check():
+        try:
+            print(f"[DEBUG] room_exists: Checking if room {room_code} exists...")
             state_key = f"game:{room_code}:state"
-            return bool(self.redis.exists(state_key))
-        
-        result = self.circuits['read'].call(
-            _redis_check,
-            fallback_func=lambda: self._fallback_room_exists(room_code)
-        )
-        
-        return result.value if result.success else False
+            players_key = f"room:{room_code}:players"
+            
+            # Room exists if either state or players key exists
+            state_exists = bool(self.redis.exists(state_key))
+            players_exist = bool(self.redis.exists(players_key))
+            exists = state_exists or players_exist
+            
+            print(f"[DEBUG] room_exists: Room {room_code} - state:{state_exists}, players:{players_exist}, exists:{exists}")
+            return exists
+        except Exception as e:
+            print(f"[DEBUG] room_exists: Redis error: {e}")
+            return self._fallback_room_exists(room_code)
     
     def create_room(self, room_code: str) -> bool:
         """Create room with circuit breaker protection"""
@@ -324,29 +351,29 @@ class ResilientRedisManager:
             players_key = f"room:{room_code}:players"
             state_key = f"game:{room_code}:state"
             
-            # Clear any existing data
-            self.redis.delete(players_key)
-            self.redis.delete(state_key)
+            # Only create if room doesn't exist
+            if self.redis.exists(state_key) or self.redis.exists(players_key):
+                print(f"[DEBUG] create_room: Room {room_code} already exists, skipping creation")
+                return True
             
             # Initialize room state
             self.redis.hset(state_key, "phase", "waiting_for_players")
             self.redis.hset(state_key, "created_at", str(int(time.time())))
+            self.redis.expire(state_key, 3600)
             
-            # Initialize empty players list
-            self.redis.rpush(players_key, json.dumps({"placeholder": True}))
-            self.redis.lrem(players_key, 1, json.dumps({"placeholder": True}))
-            self.redis.expire(players_key, 3600)
-            
+            # Note: Don't initialize players list - let add_player_to_room handle it
+            print(f"[DEBUG] create_room: Created room {room_code}")
             return True
         
         def _fallback_create():
-            # Initialize fallback storage
-            self.fallback_cache['room_players'][room_code] = []
-            self.fallback_cache['game_states'][room_code] = {
-                'phase': 'waiting_for_players',
-                'created_at': str(int(time.time()))
-            }
-            self.logger.warning(f"Using fallback storage for creating room {room_code}")
+            # Only create if room doesn't exist in fallback
+            if room_code not in self.fallback_cache['room_players'] and room_code not in self.fallback_cache['game_states']:
+                self.fallback_cache['room_players'][room_code] = []
+                self.fallback_cache['game_states'][room_code] = {
+                    'phase': 'waiting_for_players',
+                    'created_at': str(int(time.time()))
+                }
+                self.logger.warning(f"Using fallback storage for creating room {room_code}")
             return True
         
         result = self.circuits['write'].call(
@@ -528,7 +555,138 @@ class ResilientRedisManager:
         
         for player_id in expired_sessions:
             del self.fallback_cache['player_sessions'][player_id]
+    
+    def attempt_reconnect(self, player_id: str, reconnect_data: dict = None) -> tuple:
+        """
+        Attempt to reconnect a player by validating their session and updating connection status
+        
+        Args:
+            player_id: The player's ID to reconnect
+            reconnect_data: Additional data to update in the session (optional)
+            
+        Returns:
+            tuple: (is_valid, session_data or error_info)
+        """
+        try:
+            print(f"[DEBUG] attempt_reconnect: Getting session for {player_id[:8]}...")
+            # Get existing session
+            session = self.get_player_session(player_id)
+            print(f"[DEBUG] attempt_reconnect: Session retrieved: {session is not None}")
+            
+            if not session:
+                print(f"[DEBUG] attempt_reconnect: No session found")
+                return False, {'error': 'No session found for player'}
+            
+            # Check if session has required fields
+            print(f"[DEBUG] attempt_reconnect: Checking required fields...")
+            required_fields = ['username', 'room_code']
+            for field in required_fields:
+                if field not in session:
+                    print(f"[DEBUG] attempt_reconnect: Missing field: {field}")
+                    return False, {'error': f'Invalid session: missing {field}'}
+            
+            # Check if the room still exists
+            room_code = session['room_code']
+            print(f"[DEBUG] attempt_reconnect: Checking if room {room_code} exists...")
+            if not self.room_exists(room_code):
+                print(f"[DEBUG] attempt_reconnect: Room {room_code} does not exist")
+                return False, {'error': 'Game room no longer exists'}
+            
+            print(f"[DEBUG] attempt_reconnect: Room exists, updating session...")
+            # Update session with reconnection data
+            if reconnect_data:
+                session.update(reconnect_data)
+            
+            # Update connection status to active
+            session['connection_status'] = 'active'
+            session['last_reconnect'] = str(int(time.time()))
+            
+            print(f"[DEBUG] attempt_reconnect: Saving updated session...")
+            # Save updated session
+            if self.save_player_session(player_id, session):
+                print(f"[DEBUG] attempt_reconnect: Session saved successfully")
+                self.logger.info(f"Player {player_id[:8]}... successfully reconnected to room {room_code}")
+                return True, session
+            else:
+                print(f"[DEBUG] attempt_reconnect: Failed to save session")
+                return False, {'error': 'Failed to update session'}
+                
+        except Exception as e:
+            self.logger.error(f"Error during reconnection attempt for {player_id[:8]}...: {e}")
+            return False, {'error': f'Reconnection failed: {str(e)}'}
 
+    def close_player_session(self, player_id: str) -> bool:
+        """
+        Close/cleanup player session when they exit the game
+        
+        Args:
+            player_id: The player's ID whose session should be closed
+            
+        Returns:
+            bool: True if session was closed successfully
+        """
+        try:
+            print(f"[DEBUG] close_player_session: Closing session for {player_id[:8]}...")
+            
+            # Get existing session
+            session = self.get_player_session(player_id)
+            if not session:
+                print(f"[DEBUG] close_player_session: No session found for {player_id[:8]}...")
+                return True  # Already closed
+            
+            # Update session to mark as disconnected
+            session['connection_status'] = 'disconnected'
+            session['last_disconnect'] = str(int(time.time()))
+            session['exit_reason'] = 'user_exit'
+            
+            # Save updated session (don't delete - keep for reconnection)
+            if self.save_player_session(player_id, session):
+                print(f"[DEBUG] close_player_session: Session marked as disconnected for {player_id[:8]}...")
+                self.logger.info(f"Player {player_id[:8]}... session closed due to exit")
+                return True
+            else:
+                print(f"[DEBUG] close_player_session: Failed to update session for {player_id[:8]}...")
+                return False
+                
+        except Exception as e:
+            print(f"[ERROR] close_player_session: {e}")
+            self.logger.error(f"Error closing session for {player_id[:8]}...: {e}")
+            return False
 
-# Alias for backward compatibility
-RedisManager = ResilientRedisManager
+    def disconnect_player_session(self, player_id: str) -> bool:
+        """
+        Mark player session as disconnected (for unexpected disconnects)
+        
+        Args:
+            player_id: The player's ID whose session should be marked as disconnected
+            
+        Returns:
+            bool: True if session was updated successfully
+        """
+        try:
+            print(f"[DEBUG] disconnect_player_session: Disconnecting session for {player_id[:8]}...")
+            
+            # Get existing session
+            session = self.get_player_session(player_id)
+            if not session:
+                print(f"[DEBUG] disconnect_player_session: No session found for {player_id[:8]}...")
+                return True
+            
+            # Update session to mark as disconnected
+            session['connection_status'] = 'disconnected'
+            session['last_disconnect'] = str(int(time.time()))
+            session['exit_reason'] = 'connection_lost'
+            
+            # Save updated session
+            if self.save_player_session(player_id, session):
+                print(f"[DEBUG] disconnect_player_session: Session marked as disconnected for {player_id[:8]}...")
+                self.logger.info(f"Player {player_id[:8]}... session disconnected")
+                return True
+            else:
+                print(f"[DEBUG] disconnect_player_session: Failed to update session for {player_id[:8]}...")
+                return False
+                
+        except Exception as e:
+            print(f"[ERROR] disconnect_player_session: {e}")
+            self.logger.error(f"Error disconnecting session for {player_id[:8]}...: {e}")
+            return False

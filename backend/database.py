@@ -2,9 +2,14 @@
 Database configuration and connection management
 """
 import os
+import sys
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+
+# Add current directory to Python path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from models import Base
 
 # Database configuration

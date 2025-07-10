@@ -97,10 +97,23 @@ class ClientAuthManager:
                     print(f"✅ Authentication successful! Welcome back, {self.player_info['username']}")
                     return True
                 else:
-                    print(f"❌ Token authentication failed: {response_data.get('message')}")
-                    # Clear invalid session
-                    self.clear_session()
-                    return await self.prompt_authentication(websocket)
+                    error_code = response_data.get('error_code')
+                    message = response_data.get('message')
+                    
+                    if error_code == 'ALREADY_CONNECTED':
+                        print(f"\n🚫 {message}")
+                        print("\n💡 To connect from this session:")
+                        print("   1. Close the other session/window where you're connected")
+                        print("   2. Wait a few seconds for the connection to timeout")
+                        print("   3. Try connecting again")
+                        print("\nReturning to authentication menu...")
+                        self.clear_session()
+                        return await self.prompt_authentication(websocket)
+                    else:
+                        print(f"❌ Token authentication failed: {message}")
+                        # Clear invalid session
+                        self.clear_session()
+                        return await self.prompt_authentication(websocket)
             
             return False
             
@@ -177,7 +190,20 @@ class ClientAuthManager:
                           f"Win Rate: {self.player_info.get('win_percentage', 0)}%")
                     return True
                 else:
-                    print(f"❌ Login failed: {response_data.get('message')}")
+                    error_code = response_data.get('error_code')
+                    message = response_data.get('message')
+                    
+                    if error_code == 'ALREADY_CONNECTED':
+                        print(f"\n🚫 {message}")
+                        print("\n💡 To connect from this session:")
+                        print("   1. Close the other session/window where you're connected")
+                        print("   2. Wait a few seconds for the connection to timeout")
+                        print("   3. Try connecting again")
+                        print("\nReturning to main menu...")
+                        return await self.prompt_authentication(websocket)
+                    else:
+                        print(f"❌ Login failed: {message}")
+                        return await self.prompt_authentication(websocket)
                     return await self.prompt_authentication(websocket)
             
             return False
@@ -244,8 +270,20 @@ class ClientAuthManager:
                     print(f"🎮 Player ID: {self.player_info['player_id']}")
                     return True
                 else:
-                    print(f"❌ Registration failed: {response_data.get('message')}")
-                    return await self.prompt_authentication(websocket)
+                    error_code = response_data.get('error_code')
+                    message = response_data.get('message')
+                    
+                    if error_code == 'ALREADY_CONNECTED':
+                        print(f"\n🚫 {message}")
+                        print("\n💡 To connect from this session:")
+                        print("   1. Close the other session/window where you're connected")
+                        print("   2. Wait a few seconds for the connection to timeout")
+                        print("   3. Try connecting again")
+                        print("\nReturning to authentication menu...")
+                        return await self.prompt_authentication(websocket)
+                    else:
+                        print(f"❌ Registration failed: {message}")
+                        return await self.prompt_authentication(websocket)
             
             return False
             

@@ -29,9 +29,9 @@ class Player(Base):
         CheckConstraint('rating >= 0 AND rating <= 3000', name='valid_rating'),
         Index('idx_players_username', 'username'),
         Index('idx_players_email', 'email'),
-        Index('idx_players_rating', 'rating', 'total_games', postgresql_order_by=['rating DESC', 'total_games DESC']),
+        Index('idx_players_rating', 'rating', 'total_games'),
         Index('idx_players_last_seen', 'last_seen', postgresql_where='is_active = TRUE'),
-        Index('idx_players_stats', 'total_games', 'wins', 'rating', postgresql_order_by=['total_games DESC', 'wins DESC', 'rating DESC']),
+        Index('idx_players_stats', 'total_games', 'wins', 'rating'),
     )
     
     # Primary key
@@ -157,7 +157,7 @@ class GameSession(Base):
     
     # Settings and metadata
     settings = Column(JSONB, default={})
-    metadata = Column(JSONB, default={})
+    extra_data = Column(JSONB, default={})
     
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -515,7 +515,7 @@ class PlayerAchievement(Base):
     
     # Associated data
     game_session_id = Column(UUID(as_uuid=True), ForeignKey('game_sessions.id'), nullable=True)
-    metadata = Column(JSONB, default={})
+    extra_data = Column(JSONB, default={})
     
     # Timestamps
     earned_at = Column(DateTime(timezone=True), nullable=True)
@@ -563,7 +563,7 @@ class PerformanceMetrics(Base):
     
     # Context and metadata
     server_instance = Column(String(100), nullable=True)
-    metadata = Column(JSONB, default={})
+    extra_data = Column(JSONB, default={})
     tags = Column(JSONB, default=[])
     
     # Timestamps

@@ -323,7 +323,8 @@ class NetworkManager:
             
             # DEBUG: Check room state before making any changes
             print(f"[DEBUG] Before disconnect processing:")
-            redis_manager.debug_room_state(room_code)
+            # Skip debug_room_state since it doesn't exist in ResilientRedisManager
+            # redis_manager.debug_room_state(room_code)
             
             # 3. Update session in Redis
             disconnect_data = {
@@ -397,11 +398,15 @@ class NetworkManager:
     async def handle_player_reconnected(self, websocket, player_id: str, redis_manager: RedisManager):
         """Handle player reconnection with state recovery"""
         try:
+            print(f"[DEBUG] Starting reconnection for {player_id[:8]}...")
+            
             # 1. Validate and get session
+            print(f"[DEBUG] Step 1: Validating session...")
             is_valid, session = redis_manager.attempt_reconnect(player_id, {
                 'reconnected_at': str(int(time.time())),
                 'connection_status': 'active'
             })
+            print(f"[DEBUG] Session validation result: {is_valid}")
             
             if not is_valid:
                 error_msg = session.get('error', 'Failed to reconnect')
@@ -411,19 +416,23 @@ class NetworkManager:
                 
             room_code = session.get('room_code')
             username = session.get('username')
+            print(f"[DEBUG] Session data: room_code={room_code}, username={username}")
             
             if not room_code or not username:
+                print(f"[DEBUG] Invalid session data")
                 await self.notify_error(websocket, "Invalid session data")
                 return False
             
             # Additional validation: Check if player is actually in the room and disconnected
+            print(f"[DEBUG] Step 2: Getting room players...")
             room_players = redis_manager.get_room_players(room_code)
+            print(f"[DEBUG] Got {len(room_players)} players from room")
             player_in_room = None
             
             print(f"[DEBUG] Reconnection validation for player_id: {player_id}")
             
-            # Debug room state
-            redis_manager.debug_room_state(room_code)
+            # Debug room state - skip since debug_room_state doesn't exist in ResilientRedisManager
+            # redis_manager.debug_room_state(room_code)
             
             print(f"[DEBUG] Room {room_code} has {len(room_players)} players:")
             for i, player in enumerate(room_players):
@@ -448,9 +457,14 @@ class NetworkManager:
                     await self.notify_error(websocket, "No active game found. Please join a new game.")
                 return False
             
-            if player_in_room.get('connection_status') == 'active':
+            # Check if player has a live WebSocket connection
+            live_connection = self.get_live_connection(player_id)
+            if live_connection and player_in_room.get('connection_status') == 'active':
+                # Player is already connected with an active WebSocket
                 await self.notify_error(websocket, "Player is already connected")
                 return False
+            
+            print(f"[DEBUG] Player {username} reconnection allowed - live_connection: {live_connection is not None}, status: {player_in_room.get('connection_status')}")
             
             # 2. Register new connection
             self.register_connection(websocket, player_id, room_code, username)

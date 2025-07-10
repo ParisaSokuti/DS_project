@@ -143,6 +143,24 @@ def preserve_session():
     print("💾 Session preserved for future reconnections")
     print(f"📁 Session file: {SESSION_FILE}")
 
+async def handle_exit(websocket):
+    """Handle graceful exit"""
+    try:
+        # Send exit message to server
+        exit_message = {
+            "type": "exit",
+            "reason": "user_exit"
+        }
+        await websocket.send(json.dumps(exit_message))
+        
+        # Give server time to process
+        await asyncio.sleep(0.5)
+        
+        print("👋 Goodbye! Session saved for reconnection.")
+        
+    except Exception as e:
+        print(f"[ERROR] handle_exit: {e}")
+
 async def main():
     you = None
     hakem = None
@@ -152,7 +170,14 @@ async def main():
         print("Connecting to server to clear room 9999...")
         room_code = "9999"
         try:
-            async with websockets.connect(SERVER_URI) as ws:
+            async with websockets.connect(
+                SERVER_URI,
+                ping_interval=60,      # Send ping every 60 seconds
+                ping_timeout=300,      # 5 minutes timeout for ping response
+                close_timeout=300,     # 5 minutes timeout for close handshake
+                max_size=1024*1024,    # 1MB max message size
+                max_queue=100          # Max queued messages
+            ) as ws:
                 await ws.send(json.dumps({
                     'type': 'clear_room',
                     'room_code': room_code
@@ -209,39 +234,87 @@ async def main():
     else:
         print("📝 No previous session found, starting fresh")
     
-    async with websockets.connect(SERVER_URI) as ws:
-        # Phase 0: Authentication
-        if current_state == GameState.AUTHENTICATION:
-            print("\n🔐 Phase 0: Authentication")
-            authenticated = await auth_manager.authenticate_with_server(ws)
-            if not authenticated:
-                print("❌ Authentication failed. Exiting.")
-                return
-            
-            # Get player information from authentication
-            player_info = auth_manager.get_player_info()
-            player_id = player_info['player_id']
-            username = player_info['username']
-            you = username
-            
-            # Display player info
-            auth_manager.display_player_info()
-            
-            # Update session file with player ID for reconnection
-            with open(SESSION_FILE, 'w') as f:
-                f.write(player_id)
-            
-            current_state = GameState.WAITING_FOR_PLAYERS
-            print(f"\n🎮 Proceeding to game as {username}")
+    async with websockets.connect(
+        SERVER_URI,
+        ping_interval=60,      # Send ping every 60 seconds
+        ping_timeout=300,      # 5 minutes timeout for ping response
+        close_timeout=300,     # 5 minutes timeout for close handshake
+        max_size=1024*1024,    # 1MB max message size
+        max_queue=100          # Max queued messages
+    ) as ws:
+        # Phase 0: Authentication (ALWAYS required)
+        print("\n🔐 Phase 0: Authentication")
+        authenticated = await auth_manager.authenticate_with_server(ws)
+        if not authenticated:
+            print("❌ Authentication failed. Exiting.")
+            return
         
-        # Try to reconnect if we have a session, otherwise join as new player
-        if session_player_id and current_state != GameState.AUTHENTICATION:
+        # Get player information from authentication
+        player_info = auth_manager.get_player_info()
+        player_id = player_info['player_id']
+        username = player_info['username']
+        you = username
+        
+        # Display player info
+        auth_manager.display_player_info()
+        
+        # Update session file with player ID for reconnection
+        with open(SESSION_FILE, 'w') as f:
+            f.write(player_id)
+        
+        current_state = GameState.WAITING_FOR_PLAYERS
+        print(f"\n🎮 Proceeding to game as {username}")
+        
+        # Try to reconnect if we have a session and the authenticated player matches
+        if session_player_id and session_player_id == player_id:
+            print(f"🔄 Attempting to reconnect to previous game...")
             await ws.send(json.dumps({
                 "type": "reconnect",
                 "player_id": session_player_id,
                 "room_code": "9999"
             }))
+            
+            # Wait for response with timeout
+            try:
+                response = await asyncio.wait_for(ws.recv(), timeout=10.0)
+                data = json.loads(response)
+                msg_type = data.get('type')
+                
+                if msg_type == 'reconnect_success':
+                    print(f"✅ Successfully reconnected!")
+                    # Continue to main message loop
+                elif msg_type == 'error':
+                    error_msg = data.get('message', 'Unknown error')
+                    print(f"❌ Reconnection failed: {error_msg}")
+                    # If reconnection fails, try joining as new player
+                    print(f"🔄 Trying to join as new player...")
+                    await ws.send(json.dumps({
+                        "type": "join",
+                        "room_code": "9999"
+                    }))
+                else:
+                    print(f"🤔 Unexpected response during reconnection: {msg_type}")
+                    # Continue processing the message normally
+                    # Put the message back for processing
+                    import queue
+                    message_queue = queue.Queue()
+                    message_queue.put(response)
+                    
+            except asyncio.TimeoutError:
+                print(f"⏰ Reconnection request timed out")
+                print(f"   Server may be unresponsive. Trying to join as new player...")
+                try:
+                    await ws.send(json.dumps({
+                        "type": "join", 
+                        "room_code": "9999"
+                    }))
+                except Exception as e:
+                    print(f"❌ Failed to send join request: {e}")
+                    return
+                    
         else:
+            if session_player_id and session_player_id != player_id:
+                print(f"⚠️  Session player ID mismatch. Starting fresh game.")
             await ws.send(json.dumps({
                 "type": "join",
                 "room_code": "9999"
@@ -531,18 +604,40 @@ async def main():
                                 # Set variables from restored state
                                 you = game_state_data.get('you')
                                 your_team = game_state_data.get('your_team')
-                                hand_info = {'cards': game_state_data.get('hand', [])}
+                                hand = game_state_data.get('hand', [])
+                                hokm = game_state_data.get('hokm')
+                                
+                                # Update current state based on phase
+                                if phase == 'gameplay':
+                                    current_state = GameState.GAMEPLAY
+                                elif phase == 'final_deal':
+                                    current_state = GameState.FINAL_DEAL
+                                elif phase == 'hokm_selection':
+                                    current_state = GameState.WAITING_FOR_HOKM
+                                elif phase == 'team_assignment':
+                                    current_state = GameState.TEAM_ASSIGNMENT
                                 
                                 # Display current hand if available
-                                if hand_info['cards']:
+                                if hand:
                                     print(f"\n=== Your Current Hand ===")
-                                    for i, card in enumerate(hand_info['cards'], 1):
-                                        rank, suit = card.split('_')
-                                        print(f"{i:2d}. {rank} of {suit}")
+                                    sorted_hand = sort_hand(hand, hokm) if hokm else hand
+                                    for i, card in enumerate(sorted_hand, 1):
+                                        print(f"{i:2d}. {card}")
                                 
-                                hokm = game_state_data.get('hokm')
                                 if hokm:
                                     print(f"\nHokm is: {hokm.upper()}")
+                                
+                                # Display teams if available
+                                teams = game_state_data.get('teams', {})
+                                if teams:
+                                    print(f"\n=== Teams ===")
+                                    team1_players = [format_player_name(p, you) for p in teams.get('1', [])]
+                                    team2_players = [format_player_name(p, you) for p in teams.get('2', [])]
+                                    print(f"Team 1: {', '.join(team1_players)}")
+                                    print(f"Team 2: {', '.join(team2_players)}")
+                                    print(f"You are on Team {your_team}")
+                                
+                                print(f"\n✅ Game state restored successfully!")
                                 
                         except Exception as e:
                             print(f"⚠️ Warning: Could not save session: {e}")
@@ -678,62 +773,66 @@ async def main():
                     current_player = data.get('current_player')
                     hokm = data.get('hokm', hokm)  # Get hokm from turn_start
                     
-                    if current_state == GameState.GAMEPLAY:
-                        print(f"\nCurrent turn: {current_player}")
-                        # Only show hand and prompt if player has cards
-                        if hand:
-                            print("\nYour hand (organized):")
-                            sorted_hand = sort_hand(hand, hokm)
-                            for idx, card in enumerate(sorted_hand, 1):
-                                print(f"{idx}. {card}")
-                            
-                            if your_turn:
-                                # Prompt for card play
-                                print("(Type 'exit' to exit and preserve session, or 'clear_session' to reset)")
-                                while True:
-                                    try:
-                                        choice = input(f"Select a card to play (1-{len(sorted_hand)}), 'exit', or 'clear_session': ")
-                                        print(f"[DEBUG] User input: '{choice}', Hand size: {len(sorted_hand)}")
+                    # Make sure we're in the right state for gameplay
+                    if current_state != GameState.GAMEPLAY:
+                        print(f"[DEBUG] Switching to gameplay state from {current_state}")
+                        current_state = GameState.GAMEPLAY
+                    
+                    print(f"\nCurrent turn: {current_player}")
+                    # Only show hand and prompt if player has cards
+                    if hand:
+                        print("\nYour hand (organized):")
+                        sorted_hand = sort_hand(hand, hokm)
+                        for idx, card in enumerate(sorted_hand, 1):
+                            print(f"{idx}. {card}")
+                        
+                        if your_turn:
+                            # Prompt for card play
+                            print("(Type 'exit' to exit and preserve session, or 'clear_session' to reset)")
+                            while True:
+                                try:
+                                    choice = input(f"Select a card to play (1-{len(sorted_hand)}), 'exit', or 'clear_session': ")
+                                    print(f"[DEBUG] User input: '{choice}', Hand size: {len(sorted_hand)}")
+                                    
+                                    if choice.lower() == 'exit':
+                                        print("Exiting client...")
+                                        preserve_session()  # Keep session for reconnection
+                                        await ws.send(json.dumps({
+                                            'type': 'clear_room',
+                                            'room_code': room_code
+                                        }))
+                                        print("Room cleared. Exiting client.")
+                                        await ws.close()
+                                        break
+                                    elif choice.lower() == 'clear_session':
+                                        print("Clearing session and exiting...")
+                                        clear_session()  # Remove session file
+                                        await ws.send(json.dumps({
+                                            'type': 'clear_room',
+                                            'room_code': room_code
+                                        }))
+                                        print("Room cleared. Exiting client.")
+                                        await ws.close()
+                                        break
                                         
-                                        if choice.lower() == 'exit':
-                                            print("Exiting client...")
-                                            preserve_session()  # Keep session for reconnection
-                                            await ws.send(json.dumps({
-                                                'type': 'clear_room',
-                                                'room_code': room_code
-                                            }))
-                                            print("Room cleared. Exiting client.")
-                                            await ws.close()
-                                            break
-                                        elif choice.lower() == 'clear_session':
-                                            print("Clearing session and exiting...")
-                                            clear_session()  # Remove session file
-                                            await ws.send(json.dumps({
-                                                'type': 'clear_room',
-                                                'room_code': room_code
-                                            }))
-                                            print("Room cleared. Exiting client.")
-                                            await ws.close()
-                                            break
-                                            
-                                        card_idx = int(choice) - 1
-                                        print(f"[DEBUG] Calculated card_idx: {card_idx}, Valid range: 0 to {len(sorted_hand)-1}")
-                                        
-                                        if 0 <= card_idx < len(sorted_hand):
-                                            card = sorted_hand[card_idx]
-                                            print(f"[DEBUG] Selected card: {card}")
-                                            await ws.send(json.dumps({
-                                                "type": "play_card",
-                                                "room_code": room_code,
-                                                "player_id": player_id,
-                                                "card": card
-                                            }))
-                                            # Don't break here - wait for server response
-                                            # If valid, we'll get card_played. If invalid, we'll get error and re-prompt
-                                            break
-                                        else:
-                                            print(f"❌ Please enter a number between 1 and {len(sorted_hand)} or 'exit'")
-                                    except ValueError as ve:
+                                    card_idx = int(choice) - 1
+                                    print(f"[DEBUG] Calculated card_idx: {card_idx}, Valid range: 0 to {len(sorted_hand)-1}")
+                                    
+                                    if 0 <= card_idx < len(sorted_hand):
+                                        card = sorted_hand[card_idx]
+                                        print(f"[DEBUG] Selected card: {card}")
+                                        await ws.send(json.dumps({
+                                            "type": "play_card",
+                                            "room_code": room_code,
+                                            "player_id": player_id,
+                                            "card": card
+                                        }))
+                                        # Don't break here - wait for server response
+                                        # If valid, we'll get card_played. If invalid, we'll get error and re-prompt
+                                        break
+                                    else:
+                                        print(f"❌ Please enter a number between 1 and {len(sorted_hand)} or 'exit'")
+                                except ValueError as ve:
                                         print(f"[DEBUG] ValueError: {ve}")
                                         if choice.lower() == 'exit':
                                             print("Sending command to clear room and exiting...")
@@ -745,12 +844,12 @@ async def main():
                                             await ws.close()
                                             break
                                         print(f"❌ Please enter a valid number or 'exit'")
-                            else:
-                                # If hand is empty, just display waiting message
-                                print(f"\nWaiting for {data['current_player']} to play...")
                         else:
-                            # If hand is empty, just display waiting message
-                            print("\nTrick finished. Waiting for other players...")
+                            # If not your turn, just display waiting message
+                            print(f"\nWaiting for {current_player} to play...")
+                    else:
+                        # If hand is empty, just display waiting message
+                        print("\nTrick finished. Waiting for other players...")
                 elif data.get('type') == 'card_played':
                     player = data['player']
                     card = data['card']

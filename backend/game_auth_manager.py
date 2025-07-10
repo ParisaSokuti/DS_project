@@ -13,7 +13,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from auth_service import AuthenticationService
-from database import SessionLocal
+from db_connection import SessionLocal
 
 class GameAuthManager:
     """Authentication manager for game server"""
@@ -85,9 +85,32 @@ class GameAuthManager:
         result = await loop.run_in_executor(None, authenticate)
         
         if result['success']:
+            player_id = result['player_id']
+            
+            # Check if player is already connected
+            if player_id in self.player_sessions:
+                existing_websocket = self.player_sessions[player_id]
+                
+                # Check if existing connection is still active
+                if existing_websocket in self.authenticated_players:
+                    try:
+                        # Try to ping the existing connection
+                        await existing_websocket.ping()
+                        
+                        # If ping succeeds, the connection is still active
+                        return {
+                            'success': False,
+                            'message': f'User {username} is already connected from another session. Please disconnect from the other session first.',
+                            'error_code': 'ALREADY_CONNECTED'
+                        }
+                    except Exception:
+                        # Existing connection is dead, clean it up
+                        print(f"[AUTH] Cleaning up dead connection for {username}")
+                        await self._cleanup_player_session(existing_websocket)
+            
             # Store authenticated player info
             player_info = {
-                'player_id': result['player_id'],
+                'player_id': player_id,
                 'username': result['username'],
                 'display_name': result['display_name'],
                 'rating': result['rating'],
@@ -96,7 +119,9 @@ class GameAuthManager:
             }
             
             self.authenticated_players[websocket] = player_info
-            self.player_sessions[result['player_id']] = websocket
+            self.player_sessions[player_id] = websocket
+            
+            print(f"[AUTH] User {username} authenticated successfully (player_id: {player_id})")
             
             return {
                 'success': True,
@@ -134,9 +159,32 @@ class GameAuthManager:
         result = await loop.run_in_executor(None, register)
         
         if result['success']:
+            player_id = result['player_id']
+            
+            # Check if player is already connected (shouldn't happen during registration, but just in case)
+            if player_id in self.player_sessions:
+                existing_websocket = self.player_sessions[player_id]
+                
+                # Check if existing connection is still active
+                if existing_websocket in self.authenticated_players:
+                    try:
+                        # Try to ping the existing connection
+                        await existing_websocket.ping()
+                        
+                        # If ping succeeds, the connection is still active
+                        return {
+                            'success': False,
+                            'message': f'User {username} is already connected from another session.',
+                            'error_code': 'ALREADY_CONNECTED'
+                        }
+                    except Exception:
+                        # Existing connection is dead, clean it up
+                        print(f"[AUTH] Cleaning up dead connection during registration for {username}")
+                        await self._cleanup_player_session(existing_websocket)
+            
             # Store authenticated player info
             player_info = {
-                'player_id': result['player_id'],
+                'player_id': player_id,
                 'username': result['username'],
                 'display_name': result['display_name'],
                 'rating': result['rating'],
@@ -145,7 +193,9 @@ class GameAuthManager:
             }
             
             self.authenticated_players[websocket] = player_info
-            self.player_sessions[result['player_id']] = websocket
+            self.player_sessions[player_id] = websocket
+            
+            print(f"[AUTH] User {username} registered and authenticated successfully (player_id: {player_id})")
             
             return {
                 'success': True,
@@ -180,10 +230,34 @@ class GameAuthManager:
         user_info = await loop.run_in_executor(None, verify)
         
         if user_info:
+            player_id = user_info['player_id']
+            username = user_info['username']
+            
+            # Check if player is already connected
+            if player_id in self.player_sessions:
+                existing_websocket = self.player_sessions[player_id]
+                
+                # Check if existing connection is still active
+                if existing_websocket in self.authenticated_players:
+                    try:
+                        # Try to ping the existing connection
+                        await existing_websocket.ping()
+                        
+                        # If ping succeeds, the connection is still active
+                        return {
+                            'success': False,
+                            'message': f'User {username} is already connected from another session. Please disconnect from the other session first.',
+                            'error_code': 'ALREADY_CONNECTED'
+                        }
+                    except Exception:
+                        # Existing connection is dead, clean it up
+                        print(f"[AUTH] Cleaning up dead connection for {username}")
+                        await self._cleanup_player_session(existing_websocket)
+            
             # Store authenticated player info
             player_info = {
-                'player_id': user_info['player_id'],
-                'username': user_info['username'],
+                'player_id': player_id,
+                'username': username,
                 'display_name': user_info['display_name'],
                 'rating': user_info['rating'],
                 'token': token,
@@ -191,7 +265,9 @@ class GameAuthManager:
             }
             
             self.authenticated_players[websocket] = player_info
-            self.player_sessions[user_info['player_id']] = websocket
+            self.player_sessions[player_id] = websocket
+            
+            print(f"[AUTH] User {username} authenticated with token successfully (player_id: {player_id})")
             
             return {
                 'success': True,
@@ -203,6 +279,20 @@ class GameAuthManager:
                 'success': False,
                 'message': 'Invalid or expired token'
             }
+    
+    async def _cleanup_player_session(self, websocket):
+        """Clean up a player session (both mappings)"""
+        if websocket in self.authenticated_players:
+            player_info = self.authenticated_players[websocket]
+            player_id = player_info['player_id']
+            username = player_info['username']
+            
+            # Remove from both mappings
+            del self.authenticated_players[websocket]
+            if player_id in self.player_sessions:
+                del self.player_sessions[player_id]
+            
+            print(f"[AUTH] Cleaned up session for {username} (player_id: {player_id})")
     
     def get_authenticated_player(self, websocket) -> Optional[Dict[str, Any]]:
         """Get authenticated player info for a websocket"""
@@ -221,11 +311,14 @@ class GameAuthManager:
         if websocket in self.authenticated_players:
             player_info = self.authenticated_players[websocket]
             player_id = player_info['player_id']
+            username = player_info['username']
             
             # Remove from both mappings
             del self.authenticated_players[websocket]
             if player_id in self.player_sessions:
                 del self.player_sessions[player_id]
+                
+            print(f"[AUTH] Player {username} disconnected (player_id: {player_id})")
     
     def get_authenticated_players_count(self) -> int:
         """Get count of authenticated players"""

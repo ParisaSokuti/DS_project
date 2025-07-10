@@ -2,6 +2,8 @@
 Authentication Service for Hokm Card Game
 Handles user registration, login, and session management
 """
+import os
+import sys
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -9,6 +11,10 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 import jwt
 import uuid
+
+# Add current directory to Python path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from models import Player, Base
 
 
