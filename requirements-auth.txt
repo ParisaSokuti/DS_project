@@ -1,9 +1,0 @@
-# Authentication Requirements
-Flask==2.3.3
-Flask-Session==0.5.0
-Flask-CORS==4.0.0
-Werkzeug==2.3.7
-PyJWT==2.8.0
-SQLAlchemy==2.0.23
-psycopg2-binary==2.9.9
-requests==2.31.0

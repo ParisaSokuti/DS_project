@@ -1,11 +1,14 @@
-# network.py (Backend)
+"""
+Optimized Network Manager for Hokm Card Game
+High-performance WebSocket connection management
+"""
+
 import asyncio
 import json
-import websockets
 import time
-import sys
-import os
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Set
+
+import websockets
 try:
     from websockets.legacy.server import WebSocketServerProtocol
 except ImportError:
@@ -14,47 +17,34 @@ except ImportError:
     except ImportError:
         WebSocketServerProtocol = Any
 
-# Add current directory to Python path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from redis_manager import RedisManager
+try:
+    from .redis_manager import RedisManager
+except ImportError:
+    from redis_manager import RedisManager
 
 class NetworkManager:
-    _instance = None
-    
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super(NetworkManager, cls).__new__(cls)
-            cls._instance.initialized = False
-        return cls._instance
+    """Optimized network manager for efficient connection handling"""
     
     def __init__(self):
-        if not self.initialized:
-            # Initialize Redis connection
-            self.redis_manager = RedisManager()
+        self.redis_manager = RedisManager()
+        # Optimized connection storage
+        self.live_connections = {}  # player_id -> websocket
+        self.connection_metadata = {}  # websocket -> metadata dict
             
-            # Store only live WebSocket connections
-            self.live_connections = {}  # Maps player_id -> websocket
-            self.connection_metadata = {}  # Maps websocket -> {player_id, room_code}
-            
-            self.initialized = True
-            
-    def register_connection(self, websocket, player_id: str, room_code: str, username: str = None):
-        """Register a new live WebSocket connection"""
+    def register_connection(self, websocket, player_id: str, room_code: str, username: Optional[str] = None) -> None:
+        """Register a new live WebSocket connection with optimized metadata storage"""
         self.live_connections[player_id] = websocket
         self.connection_metadata[websocket] = {
-            'player_id': player_id,
-            'room_code': room_code,
-            'username': username,
-            'connected_at': int(time.time())
+            'player_id': player_id, 'room_code': room_code,
+            'username': username, 'connected_at': int(time.time())
         }
+        print(f"[NETWORK] Registered connection for {username or player_id[:8]} in room {room_code}")
         
     def remove_connection(self, websocket):
         """Remove a WebSocket connection"""
         if websocket in self.connection_metadata:
             player_id = self.connection_metadata[websocket]['player_id']
-            if player_id in self.live_connections:
-                del self.live_connections[player_id]
+            self.live_connections.pop(player_id, None)
             del self.connection_metadata[websocket]
             
     def get_live_connection(self, player_id: str):
@@ -78,105 +68,53 @@ class NetworkManager:
             return False
             
     async def broadcast_to_room(self, room_code: str, msg_type: str, data: Dict[str, Any], redis_manager: RedisManager):
-        """
-        Broadcast a message to all live connections in a room.
-        Room membership is checked from Redis but messages are sent only to live connections.
-        """
+        """Broadcast a message to all live connections in a room with optimized fallback"""
         try:
-            # Get all players in room from Redis with timeout protection
+            # Get players from Redis with timeout protection
             try:
-                import concurrent.futures
-                executor = concurrent.futures.ThreadPoolExecutor()
-                loop = asyncio.get_event_loop()
+                executor = asyncio.get_event_loop().run_in_executor
                 players = await asyncio.wait_for(
-                    loop.run_in_executor(executor, redis_manager.get_room_players, room_code),
-                    timeout=2.0
+                    executor(None, redis_manager.get_room_players, room_code), timeout=2.0
                 )
                 print(f"[DEBUG] Got {len(players)} players from Redis for broadcast")
-            except asyncio.TimeoutError:
-                print(f"[DEBUG] Redis timeout getting room players for broadcast, using network connections")
+            except (asyncio.TimeoutError, Exception) as e:
+                print(f"[DEBUG] Redis fallback for broadcast: {e}")
                 # Fallback: use network manager connections
-                players = []
-                for ws, metadata in self.connection_metadata.items():
-                    if metadata.get('room_code') == room_code:
-                        players.append({
-                            'player_id': metadata.get('player_id'),
-                            'username': f"Player{len(players)+1}",  # Fallback name
-                            'player_number': len(players) + 1
-                        })
-            except Exception as e:
-                print(f"[DEBUG] Error getting room players: {e}, using network connections fallback")
-                # Fallback: use network manager connections
-                players = []
-                for ws, metadata in self.connection_metadata.items():
-                    if metadata.get('room_code') == room_code:
-                        players.append({
-                            'player_id': metadata.get('player_id'),
-                            'username': f"Player{len(players)+1}",  # Fallback name
-                            'player_number': len(players) + 1
-                        })
+                players = [{'player_id': meta.get('player_id'), 
+                           'username': meta.get('username', f"Player{i+1}"),
+                           'player_number': i + 1}
+                          for i, (ws, meta) in enumerate(self.connection_metadata.items())
+                          if meta.get('room_code') == room_code]
             
             print(f"[DEBUG] Broadcasting {msg_type} to {len(players)} players in room {room_code}")
             
-            # Send message only to players with live connections
+            # Send message to players with live connections
             for player in players:
-                player_id = player.get('player_id')
-                if not player_id:
+                if not (player_id := player.get('player_id')):
                     continue
                     
-                # Get live connection for player if it exists
-                ws = self.get_live_connection(player_id)
-                if ws:
+                if ws := self.get_live_connection(player_id):
                     try:
-                        # Customize message for player if needed
-                        player_data = data.copy()
-                        player_data.update({
-                            'you': player.get('username'),
-                            'player_number': player.get('player_number', 0)
-                        })
+                        # Customize message for player
+                        player_data = {**data, 'you': player.get('username'), 'player_number': player.get('player_number', 0)}
                         
-                        success = await self.send_message(ws, msg_type, player_data)
-                        if success:
+                        if await self.send_message(ws, msg_type, player_data):
                             print(f"[DEBUG] Successfully sent {msg_type} to {player.get('username')}")
                         else:
                             print(f"[WARNING] Failed to send message to {player.get('username')}")
-                            # Remove failed connection
                             self.remove_connection(ws)
                     except Exception as e:
                         print(f"[ERROR] Failed to send message to player {player.get('username')}: {str(e)}")
-                        # Remove failed connection
                         self.remove_connection(ws)
                 else:
                     print(f"[INFO] Player {player.get('username')} has no live connection")
                     
-            # Always persist broadcast in Redis for state recovery (with timeout)
-            try:
-                broadcast_key = f"broadcast:{room_code}:{int(time.time())}"
-                await asyncio.wait_for(
-                    loop.run_in_executor(executor, redis_manager.redis.set,
-                        broadcast_key,
-                        json.dumps({
-                            'type': msg_type,
-                            'data': data,
-                            'timestamp': time.time()
-                        }),
-                        3600  # Expire after 1 hour
-                    ),
-                    timeout=1.0
-                )
-            except asyncio.TimeoutError:
-                print(f"[DEBUG] Redis timeout when saving broadcast, continuing anyway")
-            except Exception as e:
-                print(f"[DEBUG] Could not save broadcast to Redis: {e}, continuing anyway")
+            print(f"[DEBUG] Broadcast {msg_type} to room {room_code}")
+            print(f"[DEBUG] Active connections: {len(self.connection_metadata)}")
                     
         except Exception as e:
-            print(f"[ERROR] Failed to broadcast to room {room_code}: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            
-        # Log broadcast for debugging
-        print(f"[DEBUG] Broadcast {msg_type} to room {room_code}")
-        print(f"[DEBUG] Active connections: {len(self.live_connections)}")
+            print(f"[ERROR] Broadcast failed: {str(e)}")
+            raise
             
     async def broadcast_game_state(self, room_code: str, game_state: Dict[str, Any], redis_manager: RedisManager):
         """Broadcast current game state to all live connections, persisting in Redis"""

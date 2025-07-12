@@ -1,28 +1,55 @@
 """
-Authentication Service for Hokm Card Game
-Handles user registration, login, and session management
+Optimized Authentication Service for Hokm Card Game
+High-performance user management with caching and validation
 """
-import os
-import sys
+
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
-from werkzeug.security import generate_password_hash, check_password_hash
+
+import jwt
+import bcrypt
+from werkzeug.security import check_password_hash
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-import jwt
-import uuid
 
-# Add current directory to Python path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from models import Player, Base
+try:
+    from .models import Player
+except ImportError:
+    from models import Player
 
 
 class AuthenticationService:
+    """Optimized authentication service with bcrypt password hashing"""
+    
     def __init__(self, db_session: Session, secret_key: str):
         self.db = db_session
         self.secret_key = secret_key
         self.token_expire_hours = 24
+    
+    def _hash_password(self, password: str) -> str:
+        """Hash password using bcrypt"""
+        return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    
+    def _verify_password(self, password: str, hashed: str) -> bool:
+        """Verify password against hash - supports both bcrypt and legacy scrypt formats"""
+        try:
+            # Try bcrypt first (new format)
+            if hashed.startswith('$2b$'):
+                return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+            
+            # Try legacy scrypt format (from werkzeug)
+            elif hashed.startswith('scrypt:'):
+                return check_password_hash(hashed, password)
+            
+            # Unknown format
+            else:
+                print(f"[ERROR] Unknown password hash format: {hashed[:20]}...")
+                return False
+                
+        except Exception as e:
+            print(f"[ERROR] Password verification failed: {str(e)}")
+            return False
     
     def register_user(self, username: str, password: str, email: str = None, 
                      display_name: str = None) -> Dict[str, Any]:
@@ -61,7 +88,7 @@ class AuthenticationService:
             # Create new player
             player = Player(
                 username=username,
-                password_hash=generate_password_hash(password),
+                password_hash=self._hash_password(password),
                 email=email,
                 display_name=display_name or username,
                 created_at=datetime.utcnow(),
@@ -136,7 +163,7 @@ class AuthenticationService:
                 }
             
             # Check password
-            if not check_password_hash(player.password_hash, password):
+            if not self._verify_password(password, player.password_hash):
                 return {
                     "success": False,
                     "message": "Invalid username or password"
@@ -247,14 +274,14 @@ class AuthenticationService:
                 }
             
             # Verify old password
-            if not check_password_hash(player.password_hash, old_password):
+            if not self._verify_password(old_password, player.password_hash):
                 return {
                     "success": False,
                     "message": "Current password is incorrect"
                 }
             
             # Update password
-            player.password_hash = generate_password_hash(new_password)
+            player.password_hash = self._hash_password(new_password)
             self.db.commit()
             
             return {

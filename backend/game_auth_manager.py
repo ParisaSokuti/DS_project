@@ -9,11 +9,12 @@ from typing import Optional, Dict, Any
 import os
 import sys
 
-# Add current directory to Python path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from auth_service import AuthenticationService
-from db_connection import SessionLocal
+try:
+    from .auth_service import AuthenticationService
+    from .db_session import SessionLocal
+except ImportError:
+    from auth_service import AuthenticationService
+    from db_session import SessionLocal
 
 class GameAuthManager:
     """Authentication manager for game server"""
@@ -376,7 +377,10 @@ class GameAuthManager:
         def update_stats():
             db_session = self.get_db_session()
             try:
-                from models import Player
+                try:
+                    from .models import Player
+                except ImportError:
+                    from models import Player
                 player = db_session.query(Player).filter(Player.id == player_id).first()
                 if player:
                     # Update game statistics

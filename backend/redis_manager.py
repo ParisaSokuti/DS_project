@@ -1,57 +1,64 @@
-# redis_manager.py
+"""
+Optimized Redis Manager for Hokm Card Game
+High-performance Redis operations with connection pooling
+"""
+
 import redis
 import json
 import time
 from typing import Dict, List, Optional, Any, Tuple
 
 class RedisManager:
+    """Optimized Redis manager with connection pooling and performance monitoring"""
+    
+    # Class constants
+    VALID_PHASES = {'waiting_for_players', 'team_assignment', 'initial_deal', 
+                   'hokm_selection', 'final_deal', 'gameplay', 'hand_complete', 
+                   'game_over', 'completed'}
+    
     def __init__(self):
-        self.redis = redis.Redis(
-            host='localhost', 
-            port=6379, 
-            db=0,
-            socket_timeout=5.0,  # 5 second timeout for socket operations
-            socket_connect_timeout=3.0,  # 3 second timeout for connection
-            socket_keepalive=True,
-            socket_keepalive_options={}
+        # Connection pool for better performance
+        self.pool = redis.ConnectionPool(
+            host='localhost', port=6379, db=0,
+            socket_timeout=5.0, socket_connect_timeout=3.0,
+            socket_keepalive=True, max_connections=50, retry_on_timeout=True
         )
-        self.connection_timeout = 30  # Connection timeout in seconds
-        self.heartbeat_interval = 10  # Heartbeat check interval
-        self.metrics = {
-            'operations': 0,
-            'errors': 0,
-            'latency_sum': 0
-        }
-        self.valid_phases = ['waiting_for_players', 'team_assignment', 'initial_deal', 'hokm_selection', 'final_deal', 'gameplay', 'hand_complete', 'game_over', 'completed']
+        self.redis = redis.Redis(connection_pool=self.pool)
+        
+        # Performance metrics
+        self.metrics = {'operations': 0, 'errors': 0, 'latency_sum': 0.0}
+        self.connection_timeout = 30
+        self.heartbeat_interval = 10
     
     def _measure_latency(self, start_time: float) -> None:
-        """Update performance metrics"""
+        """Update performance metrics efficiently"""
         elapsed = time.time() - start_time
         self.metrics['latency_sum'] += elapsed
         self.metrics['operations'] += 1
         
-    def get_performance_metrics(self) -> dict:
+    def get_performance_metrics(self) -> Dict[str, float]:
         """Get current performance metrics"""
         ops = self.metrics['operations']
+        if ops == 0:
+            return {'total_operations': 0, 'error_rate': 0.0, 'avg_latency': 0.0}
+        
         return {
             'total_operations': ops,
-            'error_rate': self.metrics['errors'] / ops if ops > 0 else 0,
-            'avg_latency': self.metrics['latency_sum'] / ops if ops > 0 else 0
+            'error_rate': self.metrics['errors'] / ops,
+            'avg_latency': self.metrics['latency_sum'] / ops
         }
         
     def save_player_session(self, player_id: str, session_data: dict):
         """Save player session with enhanced monitoring"""
         try:
             key = f"session:{player_id}"
-            # Update session data but preserve existing connection_status if not provided
+            # Update session with default values
             updated_data = {
-                'last_heartbeat': str(int(time.time()))
+                'last_heartbeat': str(int(time.time())),
+                'connection_status': session_data.get('connection_status', 'active'),
+                **session_data
             }
-            # Only set connection_status to 'active' if not already specified in session_data
-            if 'connection_status' not in session_data:
-                updated_data['connection_status'] = 'active'
             
-            updated_data.update(session_data)
             self.redis.hset(key, mapping=updated_data)
             self.redis.expire(key, 3600)  # Session expires in 1 hour
             return True
@@ -60,16 +67,17 @@ class RedisManager:
             return False
     
     def get_player_session(self, player_id: str) -> dict:
+        """Get player session data"""
         key = f"session:{player_id}"
         return {k.decode(): v.decode() for k, v in self.redis.hgetall(key).items()}
     
     def add_player_to_room(self, room_code: str, player_data: dict):
+        """Add player to room with optimized error handling"""
         key = f"room:{room_code}:players"
         try:
             print(f"[DEBUG] Adding player to room {room_code}: {player_data.get('username', 'NO_NAME')}")
             self.redis.rpush(key, json.dumps(player_data))
-            # Refresh expiration whenever we modify the list
-            self.redis.expire(key, 3600)
+            self.redis.expire(key, 3600)  # Refresh expiration
             print(f"[DEBUG] Player added and expiration refreshed for room {room_code}")
         except Exception as e:
             print(f"[ERROR] Failed to add player to room {room_code}: {str(e)}")
@@ -147,28 +155,13 @@ class RedisManager:
         import signal
         start_time = time.time()
         
-        # Add timeout handler
-        def timeout_handler(signum, frame):
-            raise TimeoutError("Redis operation timed out")
-        
         try:
             key = f"game:{room_code}:state"
             print(f"[DEBUG] Step 1: About to call hgetall on key: {key}")
             
-            # Set a manual timeout of 10 seconds
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(10)  # 10 second timeout
-            
-            try:
-                raw_state = self.redis.hgetall(key)
-                signal.alarm(0)  # Cancel the timeout
-                print(f"[DEBUG] Step 2: hgetall completed, raw_state type: {type(raw_state)}, items: {len(raw_state)}")
-            except TimeoutError:
-                signal.alarm(0)  # Cancel the timeout
-                print(f"[ERROR] Redis hgetall timed out after 10 seconds")
-                elapsed = time.time() - start_time
-                print(f"[DEBUG] get_game_state END (timeout, {elapsed:.2f}s)")
-                return {}
+            # Direct Redis call without signal-based timeout (Windows compatible)
+            raw_state = self.redis.hgetall(key)
+            print(f"[DEBUG] Step 2: hgetall completed, raw_state type: {type(raw_state)}, items: {len(raw_state)}")
             
             if not raw_state:
                 print(f"[WARNING] No state found for room {room_code}")
@@ -232,17 +225,18 @@ class RedisManager:
             return False
 
     def create_room(self, room_code: str):
-        """Create a new room with proper initialization"""
+        """Create a new room with proper initialization (only if it doesn't exist)"""
         try:
             # Create room keys
             players_key = f"room:{room_code}:players"
             state_key = f"game:{room_code}:state"
             
-            # Clear any existing data
-            self.redis.delete(players_key)
-            self.redis.delete(state_key)
+            # Check if room already exists
+            if self.redis.exists(players_key) or self.redis.exists(state_key):
+                print(f"[DEBUG] Room {room_code} already exists, skipping creation")
+                return True
             
-            # Initialize empty room state
+            # Initialize empty room state (only for new rooms)
             self.redis.hset(state_key, "phase", "waiting_for_players")
             self.redis.hset(state_key, "created_at", str(int(time.time())))
             
@@ -290,10 +284,8 @@ class RedisManager:
                     if expires_at < current_time:
                         self.redis.delete(key)
                         print(f"[LOG] Cleaned up expired session: {key}")
-                        
                 except Exception as e:
                     print(f"[ERROR] Error processing session {key}: {str(e)}")
-                    
         except Exception as e:
             print(f"[ERROR] Error in cleanup_expired_sessions: {str(e)}")
     
@@ -301,8 +293,7 @@ class RedisManager:
         """Update player's last heartbeat timestamp"""
         try:
             key = f"session:{player_id}"
-            current_time = str(int(time.time()))
-            self.redis.hset(key, 'last_heartbeat', current_time)
+            self.redis.hset(key, 'last_heartbeat', str(int(time.time())))
             return True
         except Exception as e:
             print(f"[ERROR] Failed to update heartbeat for {player_id}: {str(e)}")
@@ -346,10 +337,10 @@ class RedisManager:
             # Clear and update player list
             key = f"room:{room_code}:players"
             self.redis.delete(key)
-            for player in updated_players:
-                self.redis.rpush(key, json.dumps(player))
-                
-            # Update game state if needed
+            if updated_players:
+                self.redis.rpush(key, *[json.dumps(p) for p in updated_players])
+            
+            # Clear room if empty
             if not updated_players:
                 self.clear_room(room_code)
         except Exception as e:
@@ -479,25 +470,19 @@ class RedisManager:
             print(f"[DEBUG] update_player_in_room: room {room_code} has {len(players)} players before update")
             
             # Find and update the player
-            updated = False
             for i, player in enumerate(players):
                 if player.get('player_id') == player_id:
-                    # Update the player data
                     players[i] = updated_data
-                    updated = True
                     break
-            
-            if not updated:
+            else:
                 print(f"[ERROR] Player {player_id} not found in room {room_code} for update")
                 return False
                     
-            # Clear the list and repopulate it
+            # Rebuild the list with updated data
             self.redis.delete(key)
-            for player_data in players:
-                self.redis.rpush(key, json.dumps(player_data))
-            
-            # Refresh expiration after update
-            self.redis.expire(key, 3600)
+            if players:
+                self.redis.rpush(key, *[json.dumps(p) for p in players])
+                self.redis.expire(key, 3600)
             
             print(f"[DEBUG] Successfully updated player {player_id} in room {room_code}")
             return True

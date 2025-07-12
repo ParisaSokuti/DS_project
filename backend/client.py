@@ -1,65 +1,93 @@
-# client.py
+"""
+Optimized Hokm Card Game Client
+High-performance WebSocket client with enhanced UI and error handling
+"""
+
 import asyncio
-import websockets
 import json
-import sys
-import random
 import os
+import sys
 import time
-import queue
 import hashlib
 import socket
 import getpass
+from typing import Optional, Dict, Any, List
 
-# Add current directory to Python path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import websockets
 
-from game_states import GameState
-from client_auth_manager import ClientAuthManager
+try:
+    # Try relative imports first (for module execution)
+    from .game_states import GameState
+    from .client_auth_manager import ClientAuthManager
+except ImportError:
+    # Fall back to absolute imports (for direct execution)
+    from game_states import GameState
+    from client_auth_manager import ClientAuthManager
 
 
+# Configuration
 SERVER_URI = "ws://localhost:8765"
+RECONNECT_DELAY = 5.0
+MAX_RECONNECT_ATTEMPTS = 10
 
-def get_terminal_session_id():
-    """Generate a persistent session ID for the current terminal"""
+
+def get_terminal_session_id() -> str:
+    """Generate a persistent session ID for the current terminal with optimized detection"""
+    # Try multiple terminal identification methods
+    identifiers = [
+        os.environ.get('TERM_SESSION_ID', ''),  # macOS Terminal
+        os.environ.get('WINDOWID', ''),         # X11 terminals
+        os.environ.get('SSH_TTY', ''),          # SSH sessions
+    ]
     
-    # Try to get terminal-specific identifiers
-    terminal_id = os.environ.get('TERM_SESSION_ID', '')  # macOS Terminal
-    if not terminal_id:
-        terminal_id = os.environ.get('WINDOWID', '')  # X11 terminals
-    if not terminal_id:
-        terminal_id = os.environ.get('SSH_TTY', '')  # SSH sessions
-    if not terminal_id:
-        try:
-            terminal_id = os.ttyname(0)  # Terminal device name
-        except (OSError, AttributeError):
-            terminal_id = f"{socket.gethostname()}_{getpass.getuser()}"
+    # Try terminal device name
+    try:
+        identifiers.append(os.ttyname(0))
+    except (OSError, AttributeError):
+        identifiers.append(f"{socket.gethostname()}_{getpass.getuser()}")
     
-    # Create a hash for the session file name (first 8 characters)
+    # Use first non-empty identifier
+    terminal_id = next((id for id in identifiers if id), f"default_{int(time.time())}")
+    
+    # Create hash for session file name
     session_hash = hashlib.md5(terminal_id.encode()).hexdigest()[:8]
     return f".player_session_{session_hash}"
 
-# Create persistent session file per terminal window
+
+# Session configuration
 SESSION_FILE = os.environ.get('PLAYER_SESSION', get_terminal_session_id())
 
-def display_hand_by_suit(hand, hokm=None):
+def display_hand_by_suit(hand: List[str], hokm: Optional[str] = None) -> None:
+    """Display hand organized by suit with hokm highlighting"""
     suits = ['hearts', 'diamonds', 'clubs', 'spades']
     suit_cards = {suit: [] for suit in suits}
+    
+    # Sort cards by suit
     for card in hand:
         if '_' in card:
             suit = card.split('_')[1]
             if suit in suit_cards:
                 suit_cards[suit].append(card)
-    # Hokm first
-    if hokm and suit_cards[hokm]:
-        print(f"\nHOKM - {hokm.title()}:")
-        display_suit_cards(suit_cards[hokm])
+    
+    # Display cards by suit
     for suit in suits:
-        if suit != hokm and suit_cards[suit]:
-            print(f"\n{suit.title()}:")
-            display_suit_cards(suit_cards[suit])
+        if suit_cards[suit]:
+            suit_display = f"♠️ {suit.upper()}" if suit == 'spades' else \
+                          f"♥️ {suit.upper()}" if suit == 'hearts' else \
+                          f"♦️ {suit.upper()}" if suit == 'diamonds' else \
+                          f"♣️ {suit.upper()}"
+            
+            if hokm and suit == hokm:
+                suit_display += " (HOKM)"
+            
+            print(f"{suit_display}: {', '.join(suit_cards[suit])}")
+    
+    print(f"Total cards: {len(hand)}")
+    print("=" * 50)
 
-def display_suit_cards(cards):
+
+def display_suit_cards(cards: List[str]) -> None:
+    """Display cards in a suit with numbering"""
     for i, card in enumerate(cards):
         rank, suit = card.split('_')
         print(f"  {i+1:2d}. {rank} of {suit}")

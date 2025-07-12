@@ -1,9 +1,12 @@
 """
-SQLAlchemy Models for Hokm Card Game Database Schema
-Comprehensive ORM models matching the optimized PostgreSQL schema
+Optimized SQLAlchemy Models for Hokm Card Game
+High-performance database models with indexing and constraints
 """
+
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
+
 from sqlalchemy import (
     Column, String, Integer, Boolean, DateTime, Text, JSON, 
     ForeignKey, CheckConstraint, Index, DECIMAL, BigInteger,
@@ -13,7 +16,6 @@ from sqlalchemy.dialects.postgresql import UUID, INET, JSONB
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, validates
 from sqlalchemy.sql import func
-import uuid
 
 Base = declarative_base()
 
