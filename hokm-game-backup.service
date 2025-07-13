@@ -1,0 +1,63 @@
+[Unit]
+Description=Hokm Game Backup Server
+Documentation=https://github.com/ParisaSokuti/DS_project
+After=network-online.target postgresql.service redis.service
+Wants=network-online.target postgresql.service redis.service
+Requires=network.target
+
+[Service]
+Type=simple
+User=gameserver
+Group=gameserver
+WorkingDirectory=/opt/hokm-game
+
+# Environment
+Environment=NODE_ENV=production
+Environment=PATH=/opt/hokm-game/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=/opt/hokm-game/.env
+
+# Execution
+ExecStartPre=/bin/bash -c 'source /opt/hokm-game/venv/bin/activate'
+ExecStart=/opt/hokm-game/venv/bin/python /opt/hokm-game/backend/server.py
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+
+# Restart configuration
+Restart=always
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=3
+
+# Output and logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hokm-game-backup
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/hokm-game /var/log/hokm-game /tmp
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+MemoryMax=2G
+CPUQuota=200%
+
+# Process settings
+KillMode=mixed
+TimeoutStopSec=30
+TimeoutStartSec=60
+
+# Health monitoring
+WatchdogSec=60
+
+[Install]
+WantedBy=multi-user.target
