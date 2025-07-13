@@ -1,0 +1,94 @@
+{
+  "environment": "staging",
+  "database": {
+    "host": "${DB_HOST_STAGING}",
+    "port": 5432,
+    "database": "hokm_game_staging",
+    "username": "hokm_staging",
+    "password": "${DB_PASSWORD_STAGING}",
+    "ssl_mode": "require",
+    "ssl_cert_path": "/etc/ssl/certs/client-cert.pem",
+    "ssl_key_path": "/etc/ssl/private/client-key.pem",
+    "ssl_ca_path": "/etc/ssl/certs/ca-cert.pem",
+    "pool_size": 15,
+    "max_overflow": 25,
+    "pool_timeout": 30,
+    "pool_recycle": 3600,
+    "query_timeout": 45
+  },
+  "migrations": {
+    "directory": "tests/migrations",
+    "auto_generate": false,
+    "compare_type": true,
+    "compare_server_default": true,
+    "transaction_per_migration": true,
+    "require_confirmation": true
+  },
+  "backup": {
+    "enabled": true,
+    "retention_days": 14,
+    "compression": true,
+    "verification": true,
+    "storage_location": "s3",
+    "s3_bucket": "${S3_BACKUP_BUCKET_STAGING}",
+    "s3_region": "us-west-2",
+    "encryption_key": "${BACKUP_ENCRYPTION_KEY}"
+  },
+  "deployment": {
+    "maintenance_mode": true,
+    "require_approval": true,
+    "max_downtime_seconds": 600,
+    "health_check_timeout": 120,
+    "rollback_on_failure": true,
+    "blue_green_deployment": false
+  },
+  "monitoring": {
+    "enabled": true,
+    "alert_on_failure": true,
+    "metrics_collection": true,
+    "performance_monitoring": true,
+    "detailed_logging": true,
+    "real_time_monitoring": true
+  },
+  "notifications": {
+    "enabled": true,
+    "slack_webhook": "${SLACK_WEBHOOK_STAGING}",
+    "email_recipients": ["staging-team@hokm.com", "devops@hokm.com"],
+    "notify_on_success": true,
+    "notify_on_failure": true,
+    "notify_on_rollback": true
+  },
+  "security": {
+    "encrypt_backups": true,
+    "audit_logging": true,
+    "connection_encryption": true,
+    "certificate_validation": true,
+    "access_logging": true
+  },
+  "features": {
+    "seeding": {
+      "enabled": true,
+      "include_test_data": false,
+      "include_sample_users": false,
+      "production_like_data": true
+    },
+    "smoke_tests": {
+      "enabled": true,
+      "run_after_deployment": true,
+      "fail_on_smoke_test_failure": true,
+      "comprehensive_suite": true,
+      "performance_tests": true
+    }
+  },
+  "compliance": {
+    "data_retention": {
+      "enabled": true,
+      "audit_trail_days": 90,
+      "backup_retention_days": 14
+    },
+    "gdpr": {
+      "enabled": true,
+      "anonymization": true
+    }
+  }
+}

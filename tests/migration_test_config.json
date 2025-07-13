@@ -1,0 +1,109 @@
+{
+  "redis_url": "redis://localhost:6379/0",
+  "postgres_url": "postgresql://localhost:5432/hokm_test",
+  
+  "test_phases": [
+    "pre_migration_baseline",
+    "migration_data_accuracy",
+    "post_migration_validation", 
+    "performance_comparison",
+    "rollback_procedures",
+    "ab_testing_gradual_rollout",
+    "load_testing_during_migration",
+    "data_integrity_validation"
+  ],
+  
+  "test_settings": {
+    "max_concurrent_users": 1000,
+    "test_data_size": {
+      "small": 100,
+      "medium": 1000,
+      "large": 10000
+    },
+    "performance_thresholds": {
+      "max_response_time_ms": 500,
+      "max_error_rate_percent": 1.0,
+      "min_consistency_score": 0.95,
+      "max_performance_degradation_percent": 50.0
+    },
+    "migration_settings": {
+      "batch_size": 1000,
+      "concurrent_batches": 5,
+      "retry_attempts": 3,
+      "timeout_seconds": 300
+    },
+    "rollback_settings": {
+      "max_rollback_time_seconds": 300,
+      "backup_retention_days": 7,
+      "emergency_rollback_threshold_error_rate": 5.0
+    },
+    "ab_testing_settings": {
+      "traffic_splits": [0.1, 0.5, 1.0],
+      "test_duration_hours": [24, 12, 6],
+      "success_criteria": {
+        "max_response_time_increase_percent": 20.0,
+        "max_error_rate_percent": 1.0,
+        "min_user_satisfaction": 0.8
+      },
+      "rollback_thresholds": {
+        "max_response_time_increase_percent": 50.0,
+        "max_error_rate_percent": 5.0,
+        "min_user_satisfaction": 0.6
+      }
+    },
+    "load_testing_settings": {
+      "concurrent_users": [100, 500, 1000],
+      "test_duration_minutes": 30,
+      "ramp_up_time_minutes": 5,
+      "operations_per_user": 50
+    }
+  },
+  
+  "monitoring_settings": {
+    "metrics_collection_interval_seconds": 10,
+    "alert_thresholds": {
+      "response_time_ms": 1000,
+      "error_rate_percent": 2.0,
+      "memory_usage_percent": 80.0,
+      "cpu_usage_percent": 75.0,
+      "disk_usage_percent": 85.0
+    },
+    "notification_channels": {
+      "email": "admin@hokm-game.com",
+      "slack_webhook": "https://hooks.slack.com/services/...",
+      "pagerduty_key": "your-pagerduty-integration-key"
+    }
+  },
+  
+  "database_settings": {
+    "redis": {
+      "max_connections": 100,
+      "connection_timeout_seconds": 30,
+      "retry_on_timeout": true,
+      "health_check_interval_seconds": 60
+    },
+    "postgresql": {
+      "max_connections": 50,
+      "connection_timeout_seconds": 30,
+      "query_timeout_seconds": 60,
+      "pool_size": 20,
+      "max_overflow": 30
+    }
+  },
+  
+  "reporting_settings": {
+    "output_directory": "./test_reports",
+    "report_formats": ["json", "markdown", "html"],
+    "include_raw_data": true,
+    "compress_large_reports": true,
+    "retention_days": 30
+  },
+  
+  "environment_settings": {
+    "test_environment": "staging",
+    "debug_mode": false,
+    "verbose_logging": true,
+    "log_level": "INFO",
+    "log_file": "./migration_tests.log"
+  }
+}
