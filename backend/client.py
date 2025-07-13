@@ -24,11 +24,19 @@ except ImportError:
     from game_states import GameState
     from client_auth_manager import ClientAuthManager
 
-
-# Configuration
-SERVER_URI = "ws://localhost:8765"
-RECONNECT_DELAY = 5.0
-MAX_RECONNECT_ATTEMPTS = 10
+# Try to import configuration
+try:
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+    from client_config import SERVER_URI, RECONNECT_DELAY, MAX_RECONNECT_ATTEMPTS
+    print(f"[CONFIG] Using configuration from client_config.py: {SERVER_URI}")
+except ImportError:
+    # Configuration fallback
+    SERVER_URI = "ws://192.168.1.19:8765"
+    RECONNECT_DELAY = 5.0
+    MAX_RECONNECT_ATTEMPTS = 10
+    print(f"[CONFIG] Using default configuration: {SERVER_URI}")
 
 
 def get_terminal_session_id() -> str:
@@ -296,7 +304,7 @@ async def main():
         # Try to reconnect if we have a session and the authenticated player matches
         if session_player_id and session_player_id == player_id:
             print(f"✅ Session matches current player - attempting reconnection")
-            print(f"� Connecting to previous game session...")
+            print(f"  Connecting to previous game session...")
             await ws.send(json.dumps({
                 "type": "reconnect",
                 "player_id": session_player_id,
@@ -697,39 +705,46 @@ async def main():
 
                 # Handle team assignment
                 elif msg_type == 'team_assignment':
-                            teams = data.get('teams', {})
-                            hakem = data.get('hakem')
-                            you = data.get('you')
-                            # Only print team assignment info here, not on phase_change or summary
-                            print("\n" + "="*40)
-                            print("Teams have been assigned!")
-                            print("-"*40)
-                            team1_players = [format_player_name(p, you) for p in teams.get('1', [])]
-                            team2_players = [format_player_name(p, you) for p in teams.get('2', [])]
-                            print(f"Team 1: {', '.join(team1_players)}")
-                            print(f"Team 2: {', '.join(team2_players)}")
-                            print("-"*40)
-                            print(f"Hakem is: {format_player_name(hakem, you)}")
-                            your_team = "1" if you in teams.get('1', []) else "2"
-                            print(f"\nYou are on Team {your_team}")
-                            if hakem == you:
-                                print("You are the Hakem!")
-                            print("="*40 + "\n")
+                    teams = data.get('teams', {})
+                    hakem = data.get('hakem')
+                    you = data.get('you')
+                    
+                    # Only print if this is new information (avoid duplicates)
+                    if not hasattr(main, '_last_team_assignment') or main._last_team_assignment != data:
+                        main._last_team_assignment = data
+                        print("\n" + "="*40)
+                        print("Teams have been assigned!")
+                        print("-"*40)
+                        team1_players = [format_player_name(p, you) for p in teams.get('1', [])]
+                        team2_players = [format_player_name(p, you) for p in teams.get('2', [])]
+                        print(f"Team 1: {', '.join(team1_players)}")
+                        print(f"Team 2: {', '.join(team2_players)}")
+                        print("-"*40)
+                        print(f"Hakem is: {format_player_name(hakem, you)}")
+                        your_team = "1" if you in teams.get('1', []) else "2"
+                        print(f"\nYou are on Team {your_team}")
+                        if hakem == you:
+                            print("You are the Hakem!")
+                        print("="*40 + "\n")
 
-                            # Just mark that we need to select hokm later if we're the hakem
-                            if hakem == you:
-                                await_hokm_selection = True
+                    # Just mark that we need to select hokm later if we're the hakem
+                    if hakem == you:
+                        await_hokm_selection = True
 
                         # Handle phase changes, but do NOT print team/Hakem info or call print_summary_and_hand here
                 elif msg_type == 'phase_change':
                     new_phase = data.get('new_phase')
-                    print(f"\n🔄 Game phase changed: {current_state.value} -> {new_phase}")
-                    current_state = GameState(new_phase)
-                    # Only track that hokm selection is pending; actual prompt will occur after initial_deal
-                    if new_phase == GameState.WAITING_FOR_HOKM.value and hakem == you:
-                        await_hokm_selection = True
-                    elif new_phase == GameState.GAMEPLAY.value:
-                        print("\n=== Game is starting! ===")
+                    
+                    # Only print if phase actually changed (avoid spam)
+                    if current_state.value != new_phase:
+                        print(f"\n🔄 Game phase changed: {current_state.value} -> {new_phase}")
+                        current_state = GameState(new_phase)
+                        
+                        # Only track that hokm selection is pending; actual prompt will occur after initial_deal
+                        if new_phase == GameState.WAITING_FOR_HOKM.value and hakem == you:
+                            await_hokm_selection = True
+                        elif new_phase == GameState.GAMEPLAY.value:
+                            print("\n=== Game is starting! ===")
                     continue
 
                 # Handle initial deal and hokm selection
@@ -760,8 +775,11 @@ async def main():
                 elif msg_type == 'hokm_selected':
                     suit = data.get('suit')
                     hokm = suit
-                    print(f"\n🎴 Hakem ({hakem}) has chosen {suit.upper()} as hokm!")
-                    print("Dealing remaining cards...\n")
+                    # Only print if this is new information (avoid duplicates)
+                    if not hasattr(main, '_last_hokm') or main._last_hokm != suit:
+                        main._last_hokm = suit
+                        print(f"\n🎴 Hakem ({hakem}) has chosen {suit.upper()} as hokm!")
+                        print("Dealing remaining cards...\n")
 
                 # Handle final deal after hokm selection
                 elif msg_type == 'final_deal':
@@ -1015,10 +1033,20 @@ async def main():
                     break
 
                 elif data.get('type') == 'error':
-                    print(f"❌ {data.get('message', 'Invalid move')}")
-                    if your_turn and last_turn_hand:
+                    error_msg = data.get('message', 'Invalid move')
+                    print(f"❌ {error_msg}")
+                    
+                    # Only re-prompt for card selection if it's a gameplay error and player's turn
+                    if your_turn and last_turn_hand and (
+                        "card" in error_msg.lower() or 
+                        "invalid" in error_msg.lower() or 
+                        "follow suit" in error_msg.lower() or
+                        "must" in error_msg.lower()
+                    ):
                         sorted_hand = sort_hand(last_turn_hand, hokm)
+                        print("Please try again with a valid card:")
                         print("(Type 'exit' to clear room and exit)")
+                        
                         while True:
                             try:
                                 choice = input(f"Select a card to play (1-{len(sorted_hand)}) or 'exit': ")
@@ -1031,16 +1059,18 @@ async def main():
                                     print("Room cleared. Exiting client.")
                                     await ws.close()
                                     break
+                                    
                                 card_idx = int(choice) - 1
                                 if 0 <= card_idx < len(sorted_hand):
                                     card = sorted_hand[card_idx]
+                                    print(f"[DEBUG] Retrying with card: {card}")
                                     await ws.send(json.dumps({
                                         "type": "play_card",
                                         "room_code": room_code,
                                         "player_id": player_id,
                                         "card": card
                                     }))
-                                    # Do NOT break here; wait for server response to see if move is valid
+                                    break  # Exit retry loop, wait for server response
                                 else:
                                     print(f"❌ Please enter a number between 1 and {len(sorted_hand)} or 'exit'")
                             except ValueError:
@@ -1054,7 +1084,7 @@ async def main():
                                     await ws.close()
                                     break
                                 print(f"❌ Please enter a valid number or 'exit'")
-                        # After breaking, do not break outer loop; let main loop continue to process next server message
+                    # Continue with main loop to process next server message
 
                 elif data.get('type') == 'round_result':
                     winner = data['winner']
@@ -1099,6 +1129,17 @@ async def main():
                     username = data.get('username')
                     active_players = data.get('active_players', 0)
                     print(f"\n🔄 Player reconnected: {username} ({active_players} active players)")
+                
+                elif msg_type == 'player_disconnected':
+                    username = data.get('username')
+                    active_players = data.get('active_players', 0)
+                    print(f"\n⚠️  Player disconnected: {username} ({active_players} active players)")
+                    print(f"   Game is paused. Waiting for {username} to reconnect...")
+                
+                elif msg_type == 'waiting_for_player':
+                    missing_player = data.get('missing_player')
+                    timeout_remaining = data.get('timeout_remaining', 'unknown')
+                    print(f"\n⏳ Waiting for {missing_player} to reconnect... ({timeout_remaining}s remaining)")
 
                 # State-specific validations
                 if msg_type == 'play_card' and current_state != GameState.GAMEPLAY:
@@ -1119,6 +1160,8 @@ async def main():
                     print("Server:", data)
             except websockets.exceptions.ConnectionClosed:
                 print("❌ Connection closed by server")
+                print("💾 Preserving session for potential reconnection...")
+                preserve_session()
                 break
             except Exception as e:
                 print(f"❌ Error receiving or processing message: {e}")
