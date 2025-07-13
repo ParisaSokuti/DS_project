@@ -1990,7 +1990,17 @@ async def cleanup_task(server_instance):
         await asyncio.sleep(60)  # Run every minute for better responsiveness
 
 async def main():
-    print("Starting Hokm WebSocket server on ws://0.0.0.0:8765")
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Hokm Game WebSocket Server')
+    parser.add_argument('--port', type=int, default=8765, help='Port to listen on (default: 8765)')
+    parser.add_argument('--instance-name', type=str, default='primary', help='Instance name (default: primary)')
+    parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind to (default: 0.0.0.0)')
+    
+    args = parser.parse_args()
+    
+    print(f"Starting Hokm WebSocket server ({args.instance_name}) on ws://{args.host}:{args.port}")
     print("[DEBUG] Creating GameServer instance...")
     game_server = GameServer()
     print("[DEBUG] Loading games from Redis...")
@@ -2019,42 +2029,26 @@ async def main():
                             break
                 except asyncio.CancelledError:
                     pass
-            
+
             ping_task = asyncio.create_task(ping_client())
             
+            # Handle all incoming messages
             async for message in websocket:
                 try:
                     data = json.loads(message)
                     await game_server.handle_message(websocket, data)
                 except json.JSONDecodeError:
-                    try:
-                        await game_server.network_manager.notify_error(websocket, "Invalid message format")
-                    except Exception as notify_err:
-                        print(f"[ERROR] Failed to notify JSON error: {notify_err}")
-                        # Continue the loop even if notification fails
+                    print(f"[ERROR] Invalid JSON from {websocket.remote_address}: {message}")
+                    await game_server.send_error(websocket, "Invalid JSON message")
                 except Exception as e:
-                    print(f"[ERROR] Failed to process message: {str(e)}")
-                    import traceback
-                    traceback.print_exc()  # Print full stack trace for debugging
-                    try:
-                        await game_server.network_manager.notify_error(websocket, f"Internal server error: {str(e)}")
-                    except Exception as notify_err:
-                        print(f"[ERROR] Failed to notify user of connection error: {notify_err}")
-                        # Continue the loop even if notification fails
-                    # Don't break the loop - continue processing messages
+                    print(f"[ERROR] Error processing message from {websocket.remote_address}: {str(e)}")
+                    await game_server.send_error(websocket, "Error processing message")
+                    
         except websockets.ConnectionClosed:
-            print(f"[LOG] Connection closed normally for {websocket.remote_address}")
-            await game_server.handle_connection_closed(websocket)
+            print(f"[LOG] Connection closed for {websocket.remote_address}")
         except Exception as e:
-            print(f"[ERROR] Connection handler error: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            try:
-                await game_server.network_manager.notify_error(websocket, f"Connection handler error: {str(e)}")
-            except Exception as notify_err:
-                print(f"[ERROR] Failed to notify user of connection handler error: {notify_err}")
+            print(f"[ERROR] Connection error: {str(e)}")
         finally:
-            # Always cancel ping task and handle disconnection
             if ping_task:
                 ping_task.cancel()
                 try:
@@ -2062,29 +2056,24 @@ async def main():
                 except asyncio.CancelledError:
                     pass
             
-            # Handle disconnection regardless of how the connection ended
             await game_server.handle_connection_closed(websocket)
-    
-    # Start cleanup task with server instance (disabled for debugging)
-    print("[DEBUG] Skipping cleanup task for now...")
-    # cleanup_loop = asyncio.create_task(cleanup_task(game_server))
-    # print("[DEBUG] Cleanup task started")
-    
+
     try:
-        print("[DEBUG] Starting WebSocket server...")
+        # Start the WebSocket server
+        print(f"[DEBUG] Starting WebSocket server ({args.instance_name})...")
         server = await websockets.serve(
-            handle_connection, 
-            "0.0.0.0", 
-            8765,
+            handle_connection,
+            args.host,
+            args.port,
             ping_interval=60,      # Send ping every 60 seconds
             ping_timeout=300,      # 5 minutes timeout for ping response
             close_timeout=300,     # 5 minutes timeout for close handshake
             max_size=1024*1024,    # 1MB max message size
             max_queue=100          # Max queued messages
         )
-        print("[LOG] WebSocket server is now listening on ws://0.0.0.0:8765")
-        print("[LOG] WebSocket timeouts: ping_timeout=300s, close_timeout=300s")
-        await server.wait_closed()  # Wait for server to be closed
+        print(f"[LOG] WebSocket server ({args.instance_name}) is now listening on ws://{args.host}:{args.port}")
+        print(f"[LOG] WebSocket timeouts: ping_timeout=300s, close_timeout=300s")
+        await server.wait_closed()
     except Exception as e:
         print(f"[ERROR] Server error: {str(e)}")
     # finally:

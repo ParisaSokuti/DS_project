@@ -772,3 +772,59 @@ class ResilientRedisManager:
         except Exception as e:
             print(f"[ERROR] Failed to cleanup disconnected players: {e}")
             return False
+    
+    def update_player_in_room(self, room_code: str, player_id: str, updated_data: dict):
+        """Update player data in room with circuit breaker protection"""
+        try:
+            print(f"[DEBUG] update_player_in_room: Updating player {player_id[:8]}... in room {room_code}")
+            key = f"room:{room_code}:players"
+            
+            # Get all players in the room
+            players = self.redis.lrange(key, 0, -1)
+            
+            if not players:
+                print(f"[DEBUG] update_player_in_room: No players found in room {room_code}")
+                return False
+            
+            print(f"[DEBUG] update_player_in_room: room {room_code} has {len(players)} players before update")
+            
+            # Find and update the specific player
+            updated = False
+            for i, player_bytes in enumerate(players):
+                try:
+                    player_data = json.loads(player_bytes.decode())
+                    if player_data.get('player_id') == player_id:
+                        # Update the player data
+                        player_data.update(updated_data)
+                        # Replace the entry in Redis
+                        self.redis.lset(key, i, json.dumps(player_data))
+                        updated = True
+                        print(f"[DEBUG] update_player_in_room: Updated player {player_id[:8]}... in room {room_code}")
+                        break
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    print(f"[DEBUG] update_player_in_room: Error decoding player data at index {i}: {e}")
+                    continue
+            
+            if not updated:
+                print(f"[DEBUG] update_player_in_room: Player {player_id[:8]}... not found in room {room_code}")
+                return False
+            
+            # Set expiration
+            self.redis.expire(key, 3600)
+            return True
+            
+        except Exception as e:
+            print(f"[ERROR] update_player_in_room: Redis error: {e}")
+            # Fallback to in-memory cache
+            try:
+                if room_code in self.fallback_cache['room_players']:
+                    for player in self.fallback_cache['room_players'][room_code]:
+                        if player.get('player_id') == player_id:
+                            player.update(updated_data)
+                            print(f"[DEBUG] update_player_in_room: Updated player {player_id[:8]}... in fallback cache")
+                            return True
+                print(f"[DEBUG] update_player_in_room: Player {player_id[:8]}... not found in fallback cache")
+                return False
+            except Exception as fallback_error:
+                print(f"[ERROR] update_player_in_room: Fallback failed: {fallback_error}")
+                return False
