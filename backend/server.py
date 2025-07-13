@@ -19,7 +19,14 @@ from game_board import GameBoard
 from game_states import GameState
 from redis_manager_resilient import ResilientRedisManager as RedisManager
 from circuit_breaker_monitor import CircuitBreakerMonitor
-from game_auth_manager import GameAuthManager
+try:
+    from game_auth_manager import GameAuthManager
+    DATABASE_AUTH_AVAILABLE = True
+except Exception as e:
+    print(f"[WARNING] Database authentication not available: {e}")
+    print("[INFO] Using simple file-based authentication as fallback")
+    from simple_auth_manager import SimpleAuthManager as GameAuthManager
+    DATABASE_AUTH_AVAILABLE = False
 
 # Constants
 ROOM_SIZE = 4    # Single game storage system
@@ -29,7 +36,17 @@ class GameServer:
         self.redis_manager = RedisManager()
         self.circuit_breaker_monitor = CircuitBreakerMonitor(self.redis_manager)
         self.network_manager = NetworkManager()
-        self.auth_manager = GameAuthManager()  # Add authentication manager
+        
+        # Initialize authentication manager with fallback
+        try:
+            self.auth_manager = GameAuthManager()  # Try database auth first
+            print(f"[AUTH] Authentication manager initialized (Database: {DATABASE_AUTH_AVAILABLE})")
+        except Exception as e:
+            print(f"[ERROR] Failed to initialize authentication manager: {e}")
+            from simple_auth_manager import SimpleAuthManager
+            self.auth_manager = SimpleAuthManager()
+            print("[AUTH] Using simple authentication fallback")
+            
         self.active_games = {}  # Maps room_code -> GameBoard for active games only
         self.load_active_games_from_redis()  # Load active games on startup
 
@@ -178,6 +195,15 @@ class GameServer:
             username = player_info['username']
             display_name = player_info['display_name']
             
+            # Check if this player is already in Redis for this room
+            try:
+                existing_redis_players = self.redis_manager.get_room_players(room_code)
+                player_already_in_redis = any(p.get('player_id') == player_id for p in existing_redis_players)
+                print(f"[DEBUG] Player {username} already in Redis for room {room_code}: {player_already_in_redis}")
+            except Exception as e:
+                print(f"[DEBUG] Could not check Redis for existing player: {e}")
+                player_already_in_redis = False
+            
             # Count current players in this room to assign correct player number
             current_room_count = 0
             for ws, metadata in self.network_manager.connection_metadata.items():
@@ -220,7 +246,7 @@ class GameServer:
                     debug_count += 1
             print(f"[DEBUG] Connections for room {room_code} after registration: {debug_count}")
 
-            # Add to room
+            # Add to room or update existing entry
             room_data = {
                 'player_id': player_id,
                 'username': username,
@@ -231,15 +257,25 @@ class GameServer:
             try:
                 executor = concurrent.futures.ThreadPoolExecutor()
                 loop = asyncio.get_event_loop()
-                await asyncio.wait_for(
-                    loop.run_in_executor(executor, self.redis_manager.add_player_to_room, room_code, room_data),
-                    timeout=2.0
-                )
-                print(f"[DEBUG] Added {username} to room {room_code}")
+                
+                if player_already_in_redis:
+                    # Update existing player instead of adding duplicate
+                    await asyncio.wait_for(
+                        loop.run_in_executor(executor, self.redis_manager.update_player_in_room, room_code, player_id, room_data),
+                        timeout=2.0
+                    )
+                    print(f"[DEBUG] Updated {username} in room {room_code} (reconnection)")
+                else:
+                    # Add new player
+                    await asyncio.wait_for(
+                        loop.run_in_executor(executor, self.redis_manager.add_player_to_room, room_code, room_data),
+                        timeout=2.0
+                    )
+                    print(f"[DEBUG] Added {username} to room {room_code} (new join)")
             except asyncio.TimeoutError:
-                print(f"[DEBUG] Redis timeout when adding to room, continuing anyway")
+                print(f"[DEBUG] Redis timeout when adding/updating player in room, continuing anyway")
             except Exception as e:
-                print(f"[DEBUG] Could not add to room: {e}, continuing anyway")
+                print(f"[DEBUG] Could not add/update player in room: {e}, continuing anyway")
 
             # Get updated player count after adding this player
             # Use simple counting based on network manager connections
@@ -710,11 +746,12 @@ class GameServer:
                 password = message.get('password')
                 
                 if not username or not password:
-                    await websocket.send(json.dumps({
+                    response = {
                         'type': 'auth_response',
                         'success': False,
                         'message': 'Username and password are required'
-                    }))
+                    }
+                    await websocket.send(json.dumps(response))
                     return
                 
                 auth_data = {
@@ -723,7 +760,14 @@ class GameServer:
                     'password': password
                 }
                 
-                result = await self.auth_manager.authenticate_player(websocket, auth_data)
+                try:
+                    result = await self.auth_manager.authenticate_player(websocket, auth_data)
+                except Exception as auth_error:
+                    print(f"[ERROR] Authentication manager error: {auth_error}")
+                    result = {
+                        'success': False,
+                        'message': f'Authentication failed: {str(auth_error)}'
+                    }
                 
                 response = {
                     'type': 'auth_response',
@@ -733,6 +777,8 @@ class GameServer:
                 
                 if result['success']:
                     response['player_info'] = result['player_info']
+                    if 'token' in result:
+                        response['token'] = result['token']
                     print(f"[LOG] Player authenticated: {username} (ID: {result['player_info']['player_id'][:8]}...)")
                 
                 await websocket.send(json.dumps(response))
@@ -745,11 +791,12 @@ class GameServer:
                 display_name = message.get('display_name')
                 
                 if not username or not password:
-                    await websocket.send(json.dumps({
+                    response = {
                         'type': 'auth_response',
                         'success': False,
                         'message': 'Username and password are required'
-                    }))
+                    }
+                    await websocket.send(json.dumps(response))
                     return
                 
                 auth_data = {
@@ -760,7 +807,14 @@ class GameServer:
                     'display_name': display_name
                 }
                 
-                result = await self.auth_manager.authenticate_player(websocket, auth_data)
+                try:
+                    result = await self.auth_manager.authenticate_player(websocket, auth_data)
+                except Exception as auth_error:
+                    print(f"[ERROR] Registration error: {auth_error}")
+                    result = {
+                        'success': False,
+                        'message': f'Registration failed: {str(auth_error)}'
+                    }
                 
                 response = {
                     'type': 'auth_response',
@@ -770,6 +824,8 @@ class GameServer:
                 
                 if result['success']:
                     response['player_info'] = result['player_info']
+                    if 'token' in result:
+                        response['token'] = result['token']
                     print(f"[LOG] Player registered and authenticated: {username} (ID: {result['player_info']['player_id'][:8]}...)")
                 
                 await websocket.send(json.dumps(response))
@@ -779,11 +835,12 @@ class GameServer:
                 token = message.get('token')
                 
                 if not token:
-                    await websocket.send(json.dumps({
+                    response = {
                         'type': 'auth_response',
                         'success': False,
                         'message': 'Token is required'
-                    }))
+                    }
+                    await websocket.send(json.dumps(response))
                     return
                 
                 auth_data = {
@@ -791,7 +848,14 @@ class GameServer:
                     'token': token
                 }
                 
-                result = await self.auth_manager.authenticate_player(websocket, auth_data)
+                try:
+                    result = await self.auth_manager.authenticate_player(websocket, auth_data)
+                except Exception as auth_error:
+                    print(f"[ERROR] Token authentication error: {auth_error}")
+                    result = {
+                        'success': False,
+                        'message': f'Token authentication failed: {str(auth_error)}'
+                    }
                 
                 response = {
                     'type': 'auth_response',
@@ -801,17 +865,28 @@ class GameServer:
                 
                 if result['success']:
                     response['player_info'] = result['player_info']
+                    if 'token' in result:
+                        response['token'] = result['token']
                     print(f"[LOG] Player authenticated via token: {result['player_info']['username']} (ID: {result['player_info']['player_id'][:8]}...)")
                 
                 await websocket.send(json.dumps(response))
                 
         except Exception as e:
             print(f"[ERROR] Authentication error: {str(e)}")
-            await websocket.send(json.dumps({
-                'type': 'auth_response',
-                'success': False,
-                'message': f'Authentication failed: {str(e)}'
-            }))
+            import traceback
+            traceback.print_exc()
+            
+            try:
+                error_response = {
+                    'type': 'auth_response',
+                    'success': False,
+                    'message': f'Authentication failed: {str(e)}'
+                }
+                await websocket.send(json.dumps(error_response))
+            except Exception as send_error:
+                print(f"[ERROR] Failed to send error response: {send_error}")
+                # If we can't send the error response, the WebSocket is probably closed
+                # Don't raise another exception here
 
     async def handle_hokm_selection(self, websocket, message):
         """Handle hokm selection by the Hakem, save state, broadcast, and deal remaining cards."""
@@ -1922,7 +1997,7 @@ async def main():
     game_server.load_active_games_from_redis()
     print("[DEBUG] Server initialization complete")
 
-    async def handle_connection(websocket, path):
+    async def handle_connection(websocket):
         """Handle new WebSocket connections with ping/pong health checks"""
         ping_task = None
         try:
