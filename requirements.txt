@@ -1,8 +1,0 @@
-# Hokm Card Game - Core Dependencies
-websockets>=11.0
-redis>=4.5.0
-sqlalchemy>=2.0.0
-psycopg2-binary>=2.9.0
-bcrypt>=4.0.0
-pyjwt>=2.6.0
-python-dotenv>=1.0.0
