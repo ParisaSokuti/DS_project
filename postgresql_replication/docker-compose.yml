@@ -1,0 +1,81 @@
+version: '3.8'
+
+services:
+  # Primary PostgreSQL Server
+  postgres-primary:
+    image: postgres:13
+    container_name: hokm_postgres_primary
+    environment:
+      POSTGRES_DB: hokm_game
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres123
+      POSTGRES_REPLICATION_USER: replicator
+      POSTGRES_REPLICATION_PASSWORD: repl_password123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_primary_data:/var/lib/postgresql/data
+      - ./primary/postgresql.conf:/etc/postgresql/postgresql.conf
+      - ./primary/pg_hba.conf:/etc/postgresql/pg_hba.conf
+      - ./init_primary.sql:/docker-entrypoint-initdb.d/01_init_primary.sql
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c hba_file=/etc/postgresql/pg_hba.conf
+    networks:
+      - postgres_replication
+
+  # Standby PostgreSQL Server
+  postgres-standby:
+    image: postgres:13
+    container_name: hokm_postgres_standby
+    environment:
+      POSTGRES_DB: hokm_game
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres123
+      PGUSER: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_standby_data:/var/lib/postgresql/data
+      - ./standby/postgresql.conf:/etc/postgresql/postgresql.conf
+      - ./standby/pg_hba.conf:/etc/postgresql/pg_hba.conf
+      - ./setup_standby.sh:/docker-entrypoint-initdb.d/setup_standby.sh
+    depends_on:
+      - postgres-primary
+    networks:
+      - postgres_replication
+
+  # Redis for game session management
+  redis:
+    image: redis:7-alpine
+    container_name: hokm_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - postgres_replication
+
+  # Load Balancer / Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: hokm_loadbalancer
+    ports:
+      - "8080:80"
+      - "8765:8765"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      - postgres-primary
+      - postgres-standby
+      - redis
+    networks:
+      - postgres_replication
+
+volumes:
+  postgres_primary_data:
+  postgres_standby_data:
+  redis_data:
+
+networks:
+  postgres_replication:
+    driver: bridge
