@@ -263,12 +263,47 @@ class GameServer:
                 }
             )
 
+            # Send room status update to all players in the room
+            room_players = []
+            for ws, metadata in self.network_manager.connection_metadata.items():
+                if metadata.get('room_code') == room_code:
+                    room_players.append(metadata.get('username', f"Player {metadata.get('player_number', '?')}"))
+            
+            room_status_message = {
+                'usernames': room_players,
+                'total_players': len(room_players),
+                'room_code': room_code,
+                'waiting_for': max(0, ROOM_SIZE - len(room_players))
+            }
+            
+            # Broadcast room status to all players in the room
+            await self.network_manager.broadcast_to_room(
+                room_code,
+                'room_status',
+                room_status_message,
+                self.redis_manager
+            )
+
             # Start game if room is full
             if current_player_count >= ROOM_SIZE:
                 print(f"[LOG] Room {room_code} is full, ready to play! [PHASE: {GameState.TEAM_ASSIGNMENT.value}]")
                 # Add a small delay to ensure all connections are registered
                 await asyncio.sleep(0.5)
                 await self.handle_game_start(room_code)
+            else:
+                # Inform players how many more players are needed
+                waiting_message = {
+                    'message': f"Waiting for {ROOM_SIZE - current_player_count} more player(s) to join...",
+                    'current_players': current_player_count,
+                    'required_players': ROOM_SIZE,
+                    'room_code': room_code
+                }
+                await self.network_manager.broadcast_to_room(
+                    room_code,
+                    'waiting_for_players',
+                    waiting_message,
+                    self.redis_manager
+                )
 
             return True
 

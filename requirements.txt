@@ -10,6 +10,7 @@ python-dotenv>=0.21.1,<1.0.0
 pydantic>=1.10.0,<2.0.0
 python-dateutil>=2.8.2,<3.0.0
 werkzeug>=2.3.0,<3.0.0
+pygame>=2.1.0,<3.0.0
 
 # Database dependencies
 sqlalchemy>=2.0.0,<2.1.0

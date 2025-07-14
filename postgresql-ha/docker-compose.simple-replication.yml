@@ -1,0 +1,165 @@
+version: '3.8'
+
+# Simple PostgreSQL Streaming Replication Setup for Testing
+# This setup creates a primary and standby PostgreSQL server for testing replication
+
+services:
+  # PostgreSQL Primary Server
+  postgres-primary:
+    image: postgres:15-alpine
+    container_name: hokm-postgres-primary
+    environment:
+      POSTGRES_DB: hokm_db
+      POSTGRES_USER: hokm_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hokm_password}
+      POSTGRES_REPLICATION_USER: replicator
+      POSTGRES_REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-replicator_password}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_primary_data:/var/lib/postgresql/data
+      - postgres_wal_archive:/var/lib/postgresql/wal_archive
+      - ./config/postgresql/primary.conf:/etc/postgresql/postgresql.conf:ro
+      - ./config/postgresql/pg_hba_replication.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./scripts/init_primary.sql:/docker-entrypoint-initdb.d/init_primary.sql:ro
+    networks:
+      - replication-network
+    ports:
+      - "5432:5432"  # Primary port
+    command: >
+      postgres 
+      -c config_file=/etc/postgresql/postgresql.conf
+      -c hba_file=/etc/postgresql/pg_hba.conf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hokm_user -d hokm_db"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # PostgreSQL Standby Server
+  postgres-standby:
+    image: postgres:15-alpine
+    container_name: hokm-postgres-standby
+    environment:
+      POSTGRES_DB: hokm_db
+      POSTGRES_USER: hokm_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hokm_password}
+      POSTGRES_REPLICATION_USER: replicator
+      POSTGRES_REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-replicator_password}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      PRIMARY_HOST: postgres-primary
+      PRIMARY_PORT: 5432
+    volumes:
+      - postgres_standby_data:/var/lib/postgresql/data
+      - ./config/postgresql/standby.conf:/etc/postgresql/postgresql.conf:ro
+      - ./config/postgresql/pg_hba_replication.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./scripts/init_standby.sh:/docker-entrypoint-initdb.d/init_standby.sh:ro
+    networks:
+      - replication-network
+    ports:
+      - "5433:5432"  # Standby port
+    depends_on:
+      - postgres-primary
+    command: >
+      bash -c "
+      # Wait for primary to be ready
+      until pg_isready -h postgres-primary -p 5432 -U hokm_user; do
+        echo 'Waiting for primary server...'
+        sleep 5
+      done
+      
+      # Check if data directory is empty (first run)
+      if [ ! -s /var/lib/postgresql/data/pgdata/PG_VERSION ]; then
+        echo 'Initializing standby server...'
+        
+        # Create base backup from primary
+        pg_basebackup -h postgres-primary -p 5432 -U replicator -D /var/lib/postgresql/data/pgdata -P -v -R -W
+        
+        # Create standby.signal file
+        touch /var/lib/postgresql/data/pgdata/standby.signal
+        
+        # Configure connection to primary
+        echo \"primary_conninfo = 'host=postgres-primary port=5432 user=replicator password=\$POSTGRES_REPLICATION_PASSWORD application_name=standby'\" >> /var/lib/postgresql/data/pgdata/postgresql.auto.conf
+        echo \"primary_slot_name = 'replica_slot_1'\" >> /var/lib/postgresql/data/pgdata/postgresql.auto.conf
+        
+        # Set ownership
+        chown -R postgres:postgres /var/lib/postgresql/data/pgdata
+        chmod 700 /var/lib/postgresql/data/pgdata
+      fi
+      
+      # Start PostgreSQL
+      exec postgres -c config_file=/etc/postgresql/postgresql.conf -c hba_file=/etc/postgresql/pg_hba.conf
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hokm_user -d hokm_db"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  # pgAdmin for monitoring
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: hokm-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@hokm.com
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin_password}
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - replication-network
+    ports:
+      - "8080:80"
+    depends_on:
+      - postgres-primary
+      - postgres-standby
+
+  # Monitoring with simple web interface
+  replication-monitor:
+    image: alpine:latest
+    container_name: hokm-replication-monitor
+    volumes:
+      - ./scripts/monitor_replication.sh:/monitor.sh:ro
+    networks:
+      - replication-network
+    depends_on:
+      - postgres-primary
+      - postgres-standby
+    command: >
+      sh -c "
+      apk add --no-cache postgresql-client bash
+      while true; do
+        echo '=== Replication Status at $(date) ==='
+        
+        echo 'Primary Status:'
+        psql -h postgres-primary -p 5432 -U hokm_user -d hokm_db -c 'SELECT * FROM pg_stat_replication;' || echo 'Primary not accessible'
+        
+        echo 'Standby Status:'
+        psql -h postgres-standby -p 5432 -U hokm_user -d hokm_db -c 'SELECT pg_is_in_recovery();' || echo 'Standby not accessible'
+        psql -h postgres-standby -p 5432 -U hokm_user -d hokm_db -c 'SELECT * FROM pg_stat_wal_receiver;' || echo 'WAL receiver not active'
+        
+        echo 'Replication Lag:'
+        psql -h postgres-standby -p 5432 -U hokm_user -d hokm_db -c 'SELECT EXTRACT(EPOCH FROM now() - pg_last_xact_replay_timestamp()) AS lag_seconds;' || echo 'Cannot calculate lag'
+        
+        echo '=================================='
+        sleep 60
+      done
+      "
+
+volumes:
+  postgres_primary_data:
+    driver: local
+  postgres_standby_data:
+    driver: local
+  postgres_wal_archive:
+    driver: local
+  pgadmin_data:
+    driver: local
+
+networks:
+  replication-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
