@@ -1,0 +1,80 @@
+# Hokm Game Backup Server Cron Jobs
+# This file contains all scheduled tasks for the backup server
+
+# Set PATH for cron jobs
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/hokm-game/venv/bin
+
+# Sync from primary server every 5 minutes
+*/5 * * * * cd /opt/hokm-game && /usr/local/bin/sync_backup_server.sh
+
+# Health check every minute
+* * * * * /usr/local/bin/backup_health_monitor.sh check
+
+# Extended health check every 10 minutes (includes system resources)
+*/10 * * * * /usr/local/bin/backup_health_monitor.sh check
+
+# Log rotation for application logs every hour
+0 * * * * find /var/log/hokm-game -name "*.log" -size +10M -exec logrotate -f /etc/logrotate.d/hokm-game {} \;
+
+# Clean old log files daily at 2 AM
+0 2 * * * find /var/log/hokm-game -name "*.log.*" -mtime +7 -delete
+
+# Database backup daily at 3 AM (if backup server has database)
+0 3 * * * pg_dump -h localhost -U hokm_user hokm_game | gzip > /opt/hokm-game/backups/db-$(date +\%Y\%m\%d).sql.gz 2>/dev/null || echo "Database backup failed" >> /var/log/hokm-game/backup.log
+
+# Clean old database backups (keep 14 days)
+0 4 * * * find /opt/hokm-game/backups -name "db-*.sql.gz" -mtime +14 -delete
+
+# System health report daily at 6 AM
+0 6 * * * /usr/local/bin/backup_health_monitor.sh status > /var/log/hokm-game/daily-status.log
+
+# Check disk space every hour and alert if > 85%
+0 * * * * df /opt/hokm-game | awk 'NR==2 {if ($5+0 > 85) print "WARNING: Disk usage " $5 " on backup server"}' | mail -s "Backup Server Disk Alert" admin@yourdomain.com 2>/dev/null || true
+
+# Restart service weekly for maintenance (Sunday 4 AM)
+0 4 * * 0 systemctl restart hokm-game-backup && sleep 30 && /usr/local/bin/backup_health_monitor.sh check
+
+# Update system packages weekly (Sunday 5 AM)
+0 5 * * 0 apt-get update && apt-get upgrade -y && apt-get autoremove -y
+
+# Clear temporary files daily
+0 1 * * * find /tmp -name "backup_*" -mtime +1 -delete
+
+# Monitor primary server connectivity every 5 minutes
+*/5 * * * * curl -f -s https://primary.yourdomain.com/health > /dev/null || echo "$(date): Primary server unreachable" >> /var/log/hokm-game/primary-connectivity.log
+
+# Archive old application logs monthly
+0 0 1 * * tar -czf /opt/hokm-game/backups/logs-$(date +\%Y\%m).tar.gz /var/log/hokm-game/*.log.* && find /var/log/hokm-game -name "*.log.*" -mtime +30 -delete
+
+# Check SSL certificate expiration weekly
+0 8 * * 1 openssl x509 -in /etc/ssl/certs/hokm-game/fullchain.pem -checkend 604800 -noout || echo "$(date): SSL certificate expires within 7 days" | mail -s "SSL Certificate Alert" admin@yourdomain.com 2>/dev/null || true
+
+# Performance metrics collection every 15 minutes
+*/15 * * * * top -bn1 | head -20 > /var/log/hokm-game/performance-$(date +\%Y\%m\%d-\%H\%M).log
+
+# Clean old performance logs (keep 24 hours)
+0 * * * * find /var/log/hokm-game -name "performance-*.log" -mtime +1 -delete
+
+# Check for zombie processes every hour
+0 * * * * ps aux | awk '$8 ~ /^Z/ { print "Zombie process found: " $0 }' >> /var/log/hokm-game/zombie-processes.log
+
+# Network connectivity test every 30 minutes
+*/30 * * * * ping -c 3 8.8.8.8 > /dev/null || echo "$(date): Network connectivity issue" >> /var/log/hokm-game/network.log
+
+# Redis health check every 5 minutes
+*/5 * * * * redis-cli ping > /dev/null || echo "$(date): Redis connection failed" >> /var/log/hokm-game/redis.log
+
+# PostgreSQL health check every 5 minutes
+*/5 * * * * pg_isready -h localhost -p 5432 > /dev/null || echo "$(date): PostgreSQL connection failed" >> /var/log/hokm-game/postgres.log
+
+# Check service memory usage every hour
+0 * * * * ps -p $(systemctl show --property MainPID --value hokm-game-backup) -o pid,ppid,cmd,%mem,%cpu || true
+
+# Backup configuration files daily
+0 3 * * * tar -czf /opt/hokm-game/backups/config-$(date +\%Y\%m\%d).tar.gz /opt/hokm-game/.env /etc/nginx/sites-available/hokm-backup /etc/systemd/system/hokm-game-backup.service
+
+# Clean old configuration backups (keep 30 days)
+0 4 * * * find /opt/hokm-game/backups -name "config-*.tar.gz" -mtime +30 -delete
+
+# Test email alerts weekly
+0 9 * * 1 echo "Weekly test email from backup server" | mail -s "Backup Server Test" admin@yourdomain.com 2>/dev/null || echo "$(date): Email test failed" >> /var/log/hokm-game/email-test.log

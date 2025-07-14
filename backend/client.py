@@ -18,7 +18,7 @@ from game_states import GameState
 from client_auth_manager import ClientAuthManager
 
 
-SERVER_URI = "ws://192.168.1.26:8765"
+SERVER_URI = "ws://localhost:8760"  # Load balancer port
 
 def get_terminal_session_id():
     """Generate a persistent session ID for the current terminal"""
