@@ -430,7 +430,7 @@ class HokmGameGUI:
                 self.waiting_room_screen.handle_event(event)
             elif self.current_screen == "playing":
                 self.handle_game_events(event)
-            
+    
             # Handle create room dialog if active
             if self.create_room_dialog:
                 self.create_room_dialog.handle_event(event)
@@ -463,6 +463,23 @@ class HokmGameGUI:
             running = self.handle_events()
             self.update()
             self.draw()
+            # detect end of hand/game when playing and no cards left or game_state set to game_over
+            if self.current_screen == "playing" and (self.game_state == "game_over" or not self.player_cards):
+                # mark game over
+                self.game_state = "game_over"
+                # determine winner team by highest score
+                winner = "Team 1" if self.scores["team1"] > self.scores["team2"] else "Team 2" if self.scores["team2"] > self.scores["team1"] else ""
+                # show summary and handle choice
+                choice = self.show_summary_screen(self.scores["team1"], self.scores["team2"], winner, is_game_over=True)
+                if choice == 'play_again':
+                    # reset for new hand
+                    self.initialize_game_state()
+                    self.game_state = "playing"
+                elif choice == 'lobby':
+                    # return to lobby
+                    self.show_lobby_screen()
+                else:
+                    running = False
             self.clock.tick(self.fps)
         
         print("Game client shutting down...")
@@ -724,8 +741,8 @@ class HokmGameGUI:
         if font:
             # Title
             title_text = font.render("Game Status", True, (255, 255, 255))
-            title_rect = title_text.get_rect(center=(self.status_panel_area.centerx, 
-                                                   self.status_panel_area.y + 25))
+            title_rect = title_text.get_rect(centerx=self.status_panel_area.centerx, 
+                                             top=self.status_panel_area.y + 25)
             self.screen.blit(title_text, title_rect)
         
         if small_font:
@@ -735,24 +752,24 @@ class HokmGameGUI:
             turn_text = f"Turn: {self.current_turn_player}" if hasattr(self, 'current_turn_player') else "Turn: Waiting"
             turn_color = (100, 255, 100) if getattr(self, 'my_turn', False) else (255, 255, 255)
             text = small_font.render(turn_text, True, turn_color)
-            text_rect = text.get_rect(center=(self.status_panel_area.centerx, 
-                                            self.status_panel_area.y + y_offset))
+            text_rect = text.get_rect(centerx=self.status_panel_area.centerx, 
+                                      top=self.status_panel_area.y + y_offset)
             self.screen.blit(text, text_rect)
             y_offset += 30
             
             # Hokm
             hokm_text = f"Hokm: {self.hokm_suit.title()}" if self.hokm_suit else "Hokm: Not selected"
             text = small_font.render(hokm_text, True, (255, 200, 100))
-            text_rect = text.get_rect(center=(self.status_panel_area.centerx, 
-                                            self.status_panel_area.y + y_offset))
+            text_rect = text.get_rect(centerx=self.status_panel_area.centerx, 
+                                      top=self.status_panel_area.y + y_offset)
             self.screen.blit(text, text_rect)
             y_offset += 40
             
             # Scores
             score_text = f"Team 1: {self.scores['team1']}  Team 2: {self.scores['team2']}"
             text = small_font.render(score_text, True, (200, 255, 200))
-            text_rect = text.get_rect(center=(self.status_panel_area.centerx, 
-                                            self.status_panel_area.y + y_offset))
+            text_rect = text.get_rect(centerx=self.status_panel_area.centerx, 
+                                      top=self.status_panel_area.y + y_offset)
             self.screen.blit(text, text_rect)
     
     def draw_message(self):
@@ -768,6 +785,40 @@ class HokmGameGUI:
             text = font.render(self.current_message, True, (0, 0, 0))
             text_rect = text.get_rect(center=self.message_area.center)
             self.screen.blit(text, text_rect)
+    
+    def draw_button(self, surface, rect, text, font=None, is_selected=False, colors=None):
+        """
+        Draw a reusable button with centered text and optional highlight.
+        
+        Args:
+            surface: The pygame surface to draw on
+            rect: The button rectangle (pygame.Rect)
+            text: The button text to display
+            font: The font to use for the text (optional, uses medium font if None)
+            is_selected: Whether the button is selected/highlighted
+            colors: Dictionary with color overrides (optional)
+        """
+        if font is None:
+            font = self.resources.get_font("medium")
+        
+        if colors is None:
+            colors = {
+                'normal': self.colors['button'],
+                'selected': self.colors['button_hover'],
+                'border': (200, 200, 100),
+                'text': self.colors['text']
+            }
+        
+        # Button background and border
+        bg_color = colors['selected'] if is_selected else colors['normal']
+        pygame.draw.rect(surface, bg_color, rect)
+        pygame.draw.rect(surface, colors['border'], rect, 2)
+        
+        # Button text centered
+        if font:
+            txt_surf = font.render(text, True, colors['text'])
+            txt_rect = txt_surf.get_rect(center=rect.center)
+            surface.blit(txt_surf, txt_rect)
     
     def handle_mouse_down(self, pos, button):
         """Handle mouse button down events."""
@@ -825,7 +876,144 @@ class HokmGameGUI:
             
             print(f"Played card: {card_name}")
 
-
+    def show_summary_screen(self, team1_score: int, team2_score: int, winner: str, is_game_over: bool):
+        """
+        Show game summary screen with scores and navigation options.
+        
+        Args:
+            team1_score: Score for Team 1
+            team2_score: Score for Team 2
+            winner: String indicating which team won
+            is_game_over: Boolean indicating if the entire game is over
+            
+        Returns:
+            String: 'play_again', 'lobby', or None if window closed
+        """
+        # Save previous screen state
+        prev_screen = self.current_screen
+        
+        # Setup colors
+        bg_color = (0, 80, 0)  # Dark green background
+        panel_color = (50, 50, 60)  # Dark panel
+        border_color = (200, 200, 100)  # Gold border
+        text_color = (255, 255, 255)  # White text
+        highlight_color = (255, 255, 100)  # Yellow highlight
+        
+        # Button colors
+        button_colors = {
+            'normal': (100, 100, 150),
+            'hover': (120, 120, 200),
+            'text': (255, 255, 255)
+        }
+        
+        # Get fonts
+        fonts = self.get_font_dict()
+        title_font = fonts['title'] if 'title' in fonts else fonts['large']
+        large_font = fonts['large']
+        medium_font = fonts['medium']
+        
+        # Create summary panel
+        panel_width, panel_height = 500, 400
+        panel_rect = pygame.Rect(
+            (self.screen_width - panel_width) // 2,
+            (self.screen_height - panel_height) // 2,
+            panel_width, panel_height
+        )
+        
+        # Create buttons
+        button_width, button_height = 200, 50
+        button_margin = 20
+        play_again_rect = pygame.Rect(
+            panel_rect.centerx - button_width - button_margin,
+            panel_rect.bottom - button_height - 40,
+            button_width, button_height
+        )
+        lobby_rect = pygame.Rect(
+            panel_rect.centerx + button_margin,
+            panel_rect.bottom - button_height - 40,
+            button_width, button_height
+        )
+        
+        # Function to draw the screen
+        def draw_summary():
+            # Fill the screen with background color
+            self.screen.fill(bg_color)
+            
+            # Draw centered panel
+            pygame.draw.rect(self.screen, panel_color, panel_rect)
+            pygame.draw.rect(self.screen, border_color, panel_rect, 4)
+            
+            # Draw title - 'Hand Over!' or 'Game Over!'
+            title_text = "Hand Over!" if not is_game_over else "Game Over!"
+            title_surface = title_font.render(title_text, True, text_color)
+            title_rect = title_surface.get_rect(centerx=panel_rect.centerx, top=panel_rect.top + 30)
+            self.screen.blit(title_surface, title_rect)
+            
+            # Draw scores in center - 'Team 1: X   Team 2: Y'
+            y_offset = title_rect.bottom + 40
+            scores_text = f"Team 1: {team1_score}   Team 2: {team2_score}"
+            scores_surface = large_font.render(scores_text, True, text_color)
+            scores_rect = scores_surface.get_rect(centerx=panel_rect.centerx, top=y_offset)
+            self.screen.blit(scores_surface, scores_rect)
+            
+            # Draw winner announcement below scores
+            winner_text = f"Winner: {winner}" if winner else "It's a Tie!"
+            winner_surface = large_font.render(winner_text, True, highlight_color)
+            winner_rect = winner_surface.get_rect(centerx=panel_rect.centerx, top=scores_rect.bottom + 30)
+            self.screen.blit(winner_surface, winner_rect)
+            
+            # Draw buttons
+            mouse_pos = pygame.mouse.get_pos()
+            
+            # Play Again button
+            self.draw_button(
+                self.screen, play_again_rect, "Play Again", medium_font,
+                is_selected=play_again_rect.collidepoint(mouse_pos),
+                colors={'normal': button_colors['normal'],
+                        'selected': button_colors['hover'],
+                        'border': border_color,
+                        'text': button_colors['text']}
+            )
+            
+            # Return to Lobby button
+            self.draw_button(
+                self.screen, lobby_rect, "Return to Lobby", medium_font,
+                is_selected=lobby_rect.collidepoint(mouse_pos),
+                colors={'normal': button_colors['normal'],
+                        'selected': button_colors['hover'],
+                        'border': border_color,
+                        'text': button_colors['text']}
+            )
+            
+            # Update display
+            pygame.display.flip()
+        
+        # Event loop
+        running = True
+        result = None
+        
+        while running:
+            draw_summary()
+            
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                    result = None
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    if event.button == 1:  # Left click
+                        if play_again_rect.collidepoint(event.pos):
+                            running = False
+                            result = 'play_again'
+                        elif lobby_rect.collidepoint(event.pos):
+                            running = False
+                            result = 'lobby'
+            
+            self.clock.tick(30)
+        
+        # Restore previous screen state
+        self.current_screen = prev_screen
+        
+        return result
 def main():
     """Run the enhanced Hokm game client."""
     try:
