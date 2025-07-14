@@ -6,7 +6,10 @@ Shows detailed table layout with all player positions and game areas.
 
 import pygame
 import sys
-from game_resources import GameResources
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'frontend'))
+from resources.game_resources import GameResources
 
 class HokmTableDemo:
     """Demo class to show the complete table layout."""

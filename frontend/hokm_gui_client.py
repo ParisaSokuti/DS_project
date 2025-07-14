@@ -14,10 +14,10 @@ import os
 import threading
 import queue
 import time
-from game_resources import GameResources
-from auth_ui import LoginScreen, RegisterScreen
-from lobby_ui import LobbyScreen, GameRoom, CreateRoomDialog
-from waiting_room_ui import WaitingRoomScreen
+from resources.game_resources import GameResources
+from components.auth_ui import LoginScreen, RegisterScreen
+from components.lobby_ui import LobbyScreen, GameRoom, CreateRoomDialog
+from components.waiting_room_ui import WaitingRoomScreen
 from typing import Dict, List, Optional, Tuple, Callable
 
 # Initialize Pygame

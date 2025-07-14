@@ -7,6 +7,9 @@ This will show the new drag-and-drop, hover effects, and improved visual feedbac
 import pygame
 import sys
 import os
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'frontend'))
 from hokm_gui_client import HokmGameGUI
 
 def main():

@@ -7,7 +7,8 @@ This script demonstrates loading and accessing all game resources.
 import pygame
 import sys
 import os
-from game_resources import GameResources
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'frontend'))
+from resources.game_resources import GameResources
 
 def test_resource_loading():
     """Test the resource loading system."""
@@ -160,7 +161,8 @@ if __name__ == "__main__":
         if response == 'y':
             print("Running visual test...")
             # Import and run the pygame window
-            import pygame_window
+            from pygame_window import PygameWindow
+            pygame_window = PygameWindow()
             pygame_window.main()
             
     except KeyboardInterrupt:

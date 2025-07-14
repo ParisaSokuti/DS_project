@@ -8,6 +8,9 @@ import pygame
 import json
 import time
 import threading
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'frontend'))
 from hokm_gui_client import HokmGameGUI
 
 class MessageProcessingValidator(HokmGameGUI):

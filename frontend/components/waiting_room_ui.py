@@ -7,7 +7,7 @@ Handles the pre-game waiting area where players gather before starting.
 import pygame
 import time
 from typing import List, Dict, Optional, Callable
-from auth_ui import Button
+from .auth_ui import Button
 
 class PlayerSlot:
     """Represents a player slot in the waiting room."""
@@ -207,7 +207,7 @@ class WaitingRoomScreen:
         self.chat_scroll_offset = 0
         self.max_chat_messages = 100
         
-        from auth_ui import InputField
+        from .auth_ui import InputField
         self.chat_input = InputField(
             self.chat_area_rect.x + 10, self.chat_area_rect.bottom - 40,
             self.chat_area_rect.width - 20, 30, "Type message..."

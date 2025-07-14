@@ -20,7 +20,7 @@ class GameResources:
         self.ranks = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
         
         # Paths
-        self.assets_dir = os.path.join(os.path.dirname(__file__), 'assets')
+        self.assets_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'assets')
         self.cards_dir = os.path.join(self.assets_dir, 'cards')
         self.fonts_dir = os.path.join(self.assets_dir, 'fonts')
         self.ui_dir = os.path.join(self.assets_dir, 'ui')

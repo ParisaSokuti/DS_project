@@ -7,7 +7,7 @@ Handles room listing, creation, and waiting areas.
 import pygame
 import time
 from typing import List, Dict, Optional, Callable
-from auth_ui import Button
+from .auth_ui import Button
 
 class GameRoom:
     """Represents a game room in the lobby."""
@@ -456,7 +456,7 @@ class CreateRoomDialog:
         self.overlay_color = (0, 0, 0, 180)
         
         # Input fields
-        from auth_ui import InputField
+        from .auth_ui import InputField
         
         field_width = 350
         field_height = 40
