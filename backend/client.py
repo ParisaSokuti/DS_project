@@ -986,6 +986,11 @@ async def main():
                     await ws.close()
                     break
 
+                elif data.get('type') == 'server_migration':
+                    print("🔄 Server migration in progress...")
+                    # The load balancer will handle the migration, just continue listening
+                    continue
+
                 elif data.get('type') == 'error':
                     print(f"❌ {data.get('message', 'Invalid move')}")
                     if your_turn and last_turn_hand:
