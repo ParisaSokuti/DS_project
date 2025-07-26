@@ -1,0 +1,400 @@
+# PostgreSQL High Availability Configuration
+# Production-ready streaming replication setup for Hokm game server
+
+version: '3.8'
+
+services:
+  # etcd cluster for Patroni coordination
+  etcd1:
+    image: quay.io/coreos/etcd:v3.5.9
+    container_name: hokm-etcd1
+    environment:
+      ETCD_NAME: etcd1
+      ETCD_DATA_DIR: /etcd-data
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd1:2379
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd1:2380
+      ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      ETCD_INITIAL_CLUSTER_TOKEN: hokm-etcd-cluster
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_AUTO_COMPACTION_RETENTION: "1"
+    volumes:
+      - etcd1_data:/etcd-data
+    networks:
+      - hokm-ha-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  etcd2:
+    image: quay.io/coreos/etcd:v3.5.9
+    container_name: hokm-etcd2
+    environment:
+      ETCD_NAME: etcd2
+      ETCD_DATA_DIR: /etcd-data
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd2:2379
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd2:2380
+      ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      ETCD_INITIAL_CLUSTER_TOKEN: hokm-etcd-cluster
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_AUTO_COMPACTION_RETENTION: "1"
+    volumes:
+      - etcd2_data:/etcd-data
+    networks:
+      - hokm-ha-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  etcd3:
+    image: quay.io/coreos/etcd:v3.5.9
+    container_name: hokm-etcd3
+    environment:
+      ETCD_NAME: etcd3
+      ETCD_DATA_DIR: /etcd-data
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd3:2379
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd3:2380
+      ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      ETCD_INITIAL_CLUSTER_TOKEN: hokm-etcd-cluster
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_AUTO_COMPACTION_RETENTION: "1"
+    volumes:
+      - etcd3_data:/etcd-data
+    networks:
+      - hokm-ha-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # PostgreSQL Primary with Patroni
+  postgres-primary:
+    image: postgres:15-alpine
+    container_name: hokm-postgres-primary
+    environment:
+      POSTGRES_DB: hokm_db
+      POSTGRES_USER: hokm_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_password_change_me}
+      POSTGRES_REPLICATION_USER: replicator
+      POSTGRES_REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-replication_password_change_me}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      # High availability settings
+      POSTGRES_MAX_CONNECTIONS: 200
+      POSTGRES_SHARED_BUFFERS: 256MB
+      POSTGRES_EFFECTIVE_CACHE_SIZE: 1GB
+      POSTGRES_WORK_MEM: 4MB
+      POSTGRES_MAINTENANCE_WORK_MEM: 64MB
+      # WAL settings for replication
+      POSTGRES_WAL_LEVEL: replica
+      POSTGRES_MAX_WAL_SENDERS: 5
+      POSTGRES_MAX_REPLICATION_SLOTS: 5
+      POSTGRES_WAL_KEEP_SIZE: 1GB
+      POSTGRES_HOT_STANDBY: 'on'
+      POSTGRES_ARCHIVE_MODE: 'on'
+      POSTGRES_ARCHIVE_COMMAND: 'test ! -f /var/lib/postgresql/wal_archive/%f && cp %p /var/lib/postgresql/wal_archive/%f'
+      # Gaming optimizations
+      POSTGRES_RANDOM_PAGE_COST: 1.1
+      POSTGRES_EFFECTIVE_IO_CONCURRENCY: 200
+      POSTGRES_CHECKPOINT_COMPLETION_TARGET: 0.9
+      POSTGRES_WAL_BUFFERS: 16MB
+      POSTGRES_DEFAULT_STATISTICS_TARGET: 100
+    volumes:
+      - postgres_primary_data:/var/lib/postgresql/data
+      - postgres_wal_archive:/var/lib/postgresql/wal_archive
+      - ./config/postgresql/primary:/docker-entrypoint-initdb.d
+      - ./config/postgresql/patroni-primary.yml:/etc/patroni/patroni.yml:ro
+    networks:
+      - hokm-ha-network
+    ports:
+      - "5433:5432"  # Primary port
+    depends_on:
+      - etcd1
+      - etcd2
+      - etcd3
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hokm_user -d hokm_db"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # PostgreSQL Replica 1 with Patroni
+  postgres-replica1:
+    image: postgres:15-alpine
+    container_name: hokm-postgres-replica1
+    environment:
+      POSTGRES_DB: hokm_db
+      POSTGRES_USER: hokm_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_password_change_me}
+      POSTGRES_REPLICATION_USER: replicator
+      POSTGRES_REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-replication_password_change_me}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      # Replica-specific settings
+      POSTGRES_PRIMARY_CONNINFO: 'host=postgres-primary port=5432 user=replicator password=${REPLICATION_PASSWORD:-replication_password_change_me} application_name=replica1'
+      POSTGRES_HOT_STANDBY: 'on'
+      POSTGRES_MAX_STANDBY_STREAMING_DELAY: 30s
+      POSTGRES_MAX_STANDBY_ARCHIVE_DELAY: 60s
+      # Performance settings
+      POSTGRES_MAX_CONNECTIONS: 200
+      POSTGRES_SHARED_BUFFERS: 256MB
+      POSTGRES_EFFECTIVE_CACHE_SIZE: 1GB
+      POSTGRES_WORK_MEM: 4MB
+    volumes:
+      - postgres_replica1_data:/var/lib/postgresql/data
+      - ./config/postgresql/replica:/docker-entrypoint-initdb.d
+      - ./config/postgresql/patroni-replica1.yml:/etc/patroni/patroni.yml:ro
+    networks:
+      - hokm-ha-network
+    ports:
+      - "5434:5432"  # Replica 1 port
+    depends_on:
+      - postgres-primary
+      - etcd1
+      - etcd2
+      - etcd3
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hokm_user -d hokm_db"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # PostgreSQL Replica 2 with Patroni
+  postgres-replica2:
+    image: postgres:15-alpine
+    container_name: hokm-postgres-replica2
+    environment:
+      POSTGRES_DB: hokm_db
+      POSTGRES_USER: hokm_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_password_change_me}
+      POSTGRES_REPLICATION_USER: replicator
+      POSTGRES_REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-replication_password_change_me}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      # Replica-specific settings
+      POSTGRES_PRIMARY_CONNINFO: 'host=postgres-primary port=5432 user=replicator password=${REPLICATION_PASSWORD:-replication_password_change_me} application_name=replica2'
+      POSTGRES_HOT_STANDBY: 'on'
+      POSTGRES_MAX_STANDBY_STREAMING_DELAY: 30s
+      POSTGRES_MAX_STANDBY_ARCHIVE_DELAY: 60s
+      # Performance settings
+      POSTGRES_MAX_CONNECTIONS: 200
+      POSTGRES_SHARED_BUFFERS: 256MB
+      POSTGRES_EFFECTIVE_CACHE_SIZE: 1GB
+      POSTGRES_WORK_MEM: 4MB
+    volumes:
+      - postgres_replica2_data:/var/lib/postgresql/data
+      - ./config/postgresql/replica:/docker-entrypoint-initdb.d
+      - ./config/postgresql/patroni-replica2.yml:/etc/patroni/patroni.yml:ro
+    networks:
+      - hokm-ha-network
+    ports:
+      - "5435:5432"  # Replica 2 port
+    depends_on:
+      - postgres-primary
+      - etcd1
+      - etcd2
+      - etcd3
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hokm_user -d hokm_db"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # HAProxy for load balancing and read/write splitting
+  haproxy:
+    image: haproxy:2.8-alpine
+    container_name: hokm-haproxy
+    volumes:
+      - ./config/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./config/haproxy/errors:/usr/local/etc/haproxy/errors:ro
+    networks:
+      - hokm-ha-network
+    ports:
+      - "5432:5432"   # Main PostgreSQL port (load balanced)
+      - "8404:8404"   # HAProxy stats
+    depends_on:
+      - postgres-primary
+      - postgres-replica1
+      - postgres-replica2
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "haproxy", "-f", "/usr/local/etc/haproxy/haproxy.cfg", "-c"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # pgBouncer connection pooler for primary
+  pgbouncer-primary:
+    image: pgbouncer/pgbouncer:1.20.1
+    container_name: hokm-pgbouncer-primary
+    environment:
+      DATABASES_HOST: postgres-primary
+      DATABASES_PORT: 5432
+      DATABASES_USER: hokm_user
+      DATABASES_PASSWORD: ${POSTGRES_PASSWORD:-secure_password_change_me}
+      DATABASES_DBNAME: hokm_db
+      POOL_MODE: transaction
+      SERVER_RESET_QUERY: DISCARD ALL
+      MAX_CLIENT_CONN: 200
+      DEFAULT_POOL_SIZE: 25
+      MIN_POOL_SIZE: 5
+      RESERVE_POOL_SIZE: 5
+      SERVER_LIFETIME: 3600
+      SERVER_IDLE_TIMEOUT: 600
+    volumes:
+      - ./config/pgbouncer/pgbouncer-primary.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./config/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    networks:
+      - hokm-ha-network
+    depends_on:
+      - postgres-primary
+    restart: unless-stopped
+
+  # pgBouncer connection pooler for replicas
+  pgbouncer-replicas:
+    image: pgbouncer/pgbouncer:1.20.1
+    container_name: hokm-pgbouncer-replicas
+    environment:
+      DATABASES_HOST: postgres-replica1,postgres-replica2
+      DATABASES_PORT: 5432
+      DATABASES_USER: hokm_user
+      DATABASES_PASSWORD: ${POSTGRES_PASSWORD:-secure_password_change_me}
+      DATABASES_DBNAME: hokm_db
+      POOL_MODE: transaction
+      SERVER_RESET_QUERY: DISCARD ALL
+      MAX_CLIENT_CONN: 300
+      DEFAULT_POOL_SIZE: 20
+      MIN_POOL_SIZE: 5
+      RESERVE_POOL_SIZE: 5
+      SERVER_LIFETIME: 3600
+      SERVER_IDLE_TIMEOUT: 600
+    volumes:
+      - ./config/pgbouncer/pgbouncer-replicas.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./config/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    networks:
+      - hokm-ha-network
+    depends_on:
+      - postgres-replica1
+      - postgres-replica2
+    restart: unless-stopped
+
+  # Prometheus for monitoring
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: hokm-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./config/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    networks:
+      - hokm-ha-network
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  # Grafana for dashboards
+  grafana:
+    image: grafana/grafana:10.1.0
+    container_name: hokm-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin_change_me}
+      GF_INSTALL_PLUGINS: grafana-piechart-panel,grafana-worldmap-panel
+      GF_FEATURE_TOGGLES_ENABLE: publicDashboards
+    volumes:
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    networks:
+      - hokm-ha-network
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # AlertManager for alerts
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    container_name: hokm-alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+      - '--web.external-url=http://localhost:9093'
+    volumes:
+      - ./config/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    networks:
+      - hokm-ha-network
+    ports:
+      - "9093:9093"
+    restart: unless-stopped
+
+  # PostgreSQL Exporter for metrics
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.13.2
+    container_name: hokm-postgres-exporter
+    environment:
+      DATA_SOURCE_NAME: "postgresql://hokm_user:${POSTGRES_PASSWORD:-secure_password_change_me}@postgres-primary:5432/hokm_db?sslmode=disable"
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres_exporter/queries.yml
+    volumes:
+      - ./config/postgres-exporter/queries.yml:/etc/postgres_exporter/queries.yml:ro
+    networks:
+      - hokm-ha-network
+    ports:
+      - "9187:9187"
+    depends_on:
+      - postgres-primary
+    restart: unless-stopped
+
+volumes:
+  etcd1_data:
+    driver: local
+  etcd2_data:
+    driver: local
+  etcd3_data:
+    driver: local
+  postgres_primary_data:
+    driver: local
+  postgres_replica1_data:
+    driver: local
+  postgres_replica2_data:
+    driver: local
+  postgres_wal_archive:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  alertmanager_data:
+    driver: local
+
+networks:
+  hokm-ha-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
